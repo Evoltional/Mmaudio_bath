@@ -2,6 +2,7 @@ import json
 import re
 import shutil
 import subprocess
+import sys
 import threading
 import time
 import traceback
@@ -124,11 +125,23 @@ def wait_for_prompt(comfy_url, pid):
             return r.json()[pid]
 
 # ================= FFmpeg 工具 =================
+def get_subprocess_kwargs():
+    """返回适用于 subprocess.run 的通用参数，Windows 下隐藏命令行窗口"""
+    kwargs = dict(
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace"
+    )
+    if sys.platform == "win32":
+        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+    return kwargs
+
 def get_duration(file_path, ffprobe_path):
     try:
         cmd = [ffprobe_path, "-v", "error", "-show_entries", "format=duration",
                "-of", "default=noprint_wrappers=1:nokey=1", str(file_path)]
-        r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+        r = subprocess.run(cmd, **get_subprocess_kwargs())
         if r.returncode == 0 and r.stdout.strip():
             return float(r.stdout.strip())
     except Exception as e:
@@ -159,7 +172,7 @@ def _merge_two_clips(clip1, clip2, ffmpeg_path, output_dir):
         "-c:a", "aac", "-b:a", "192k",
         str(merged_path)
     ]
-    r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    r = subprocess.run(cmd, **get_subprocess_kwargs())
     if r.returncode != 0:
         log(f"合并 {clip1.name} 与 {clip2.name} 失败:\n{r.stderr}")
         return None
@@ -256,7 +269,7 @@ def split_video(input_path, dur, ffmpeg_path, output_dir):
         "-reset_timestamps", "1",
         pattern
     ]
-    r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    r = subprocess.run(cmd, **get_subprocess_kwargs())
     safe_input.unlink(missing_ok=True)
     if r.returncode != 0:
         err_msg = r.stderr.strip() or r.stdout.strip() or "未知错误"
@@ -300,8 +313,8 @@ def split_video(input_path, dur, ffmpeg_path, output_dir):
                 str(part2)
             ]
 
-            r1 = subprocess.run(cmd1, capture_output=True, text=True, encoding="utf-8", errors="replace")
-            r2 = subprocess.run(cmd2, capture_output=True, text=True, encoding="utf-8", errors="replace")
+            r1 = subprocess.run(cmd1, **get_subprocess_kwargs())
+            r2 = subprocess.run(cmd2, **get_subprocess_kwargs())
             if r1.returncode == 0 and r2.returncode == 0:
                 log(f"  切割成功: {part1.name} + {part2.name}")
                 clip.unlink(missing_ok=True)
@@ -485,7 +498,7 @@ def process_single_video(video_path, config, in_progress_state=None):
         "-c:a", "aac", "-b:a", "192k",
         str(final)
     ]
-    r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    r = subprocess.run(cmd, **get_subprocess_kwargs())
     concat_txt.unlink(missing_ok=True)
 
     if config.get("clear_output", True):
@@ -536,7 +549,7 @@ def manual_merge(video_name, ffmpeg_path):
         "-c:a", "aac", "-b:a", "192k",
         str(output_path)
     ]
-    r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    r = subprocess.run(cmd, **get_subprocess_kwargs())
     concat_txt.unlink(missing_ok=True)
 
     if r.returncode == 0:
