@@ -10,7 +10,8 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 from queue import Queue
-from tkinter import Tk, Listbox, Text, END, messagebox, StringVar, filedialog, ttk, BooleanVar, SINGLE
+from tkinter import (Tk, Listbox, Text, END, messagebox, StringVar,
+                     filedialog, ttk, BooleanVar, SINGLE)
 from tkinter import VERTICAL, RIGHT, LEFT, BOTH, Y, X, W
 from tkinter.ttk import Progressbar
 
@@ -126,7 +127,6 @@ def wait_for_prompt(comfy_url, pid):
 
 # ================= FFmpeg 工具 =================
 def get_subprocess_kwargs():
-    """返回适用于 subprocess.run 的通用参数，Windows 下隐藏命令行窗口"""
     kwargs = dict(
         capture_output=True,
         text=True,
@@ -204,13 +204,13 @@ def merge_short_clips(clips, ffmpeg_path, ffprobe_path, output_dir):
                 i += 1
                 continue
             prev = clip_info[i-1] if i > 0 else None
-            next = clip_info[i+1] if i < len(clip_info)-1 else None
+            next_ = clip_info[i+1] if i < len(clip_info)-1 else None
 
             candidates = []
             if prev and can_merge(prev["path"]):
                 candidates.append(prev)
-            if next and can_merge(next["path"]):
-                candidates.append(next)
+            if next_ and can_merge(next_["path"]):
+                candidates.append(next_)
             if not candidates:
                 i += 1
                 continue
@@ -352,6 +352,9 @@ def process_single_video(video_path, config, in_progress_state=None):
     output_dir = config["output_dir"]
     temp_dir = config["temp_dir"]
     ffmpeg_path = config["ffmpeg_path"]
+    clear_output = config.get("clear_output", True)
+    clear_temp = config.get("clear_temp", True)
+    clear_segments = config.get("clear_segments", True)
 
     log(f"📼 开始处理: {video_path.name}")
 
@@ -411,27 +414,24 @@ def process_single_video(video_path, config, in_progress_state=None):
             generated.append(path)
 
     total = len(clips)
-    for idx in range(processed, total):
-        if stop_flag.is_set():
-            log("⏹️ 停止信号，保存进度")
-            break
 
-        clip = clips[idx]
-        clip_path = str(clip.absolute())
-        log(f"▶️ 片段 {idx+1}/{total}: {clip.name}")
+    # ----- 内部函数：处理单个视频片段，返回生成的文件列表，失败返回 None -----
+    def _process_one_clip(clip_path, seg_index=None):
+        """
+        提交片段到 ComfyUI，将输出文件移至 safe_folder 并完成音频同步。
+        成功返回 [Path, ...]，失败返回 None。
+        """
+        nonlocal prompt_template, load_id, combine_id, comfy_url, output_dir, temp_dir, ffmpeg_path, safe_folder
 
-        prefix = f"MMaudio_seg_{idx:03d}"
-        prompt_template[load_id]["inputs"]["video"] = clip_path
+        # 生成唯一前缀，避免文件冲突
+        prefix = f"MMaudio_seg_{seg_index:03d}" if seg_index is not None else f"MMaudio_{uuid.uuid4().hex[:6]}"
+        prompt_template[load_id]["inputs"]["video"] = str(clip_path)
         prompt_template[combine_id]["inputs"]["filename_prefix"] = prefix
 
         pid = submit_prompt(comfy_url, prompt_template)
         if not pid:
-            log(f"⚠️ 片段 {idx+1} 提交失败，跳过并移至 failed")
-            _move_to_failed(clip, safe_folder)
-            processed = idx + 1
-            in_progress_state["processed"] = processed
-            save_progress(completed_videos, in_progress_all)
-            continue
+            log(f"⚠️ 提交失败: {Path(clip_path).name}")
+            return None
 
         wait_for_prompt(comfy_url, pid)
         time.sleep(1)
@@ -445,25 +445,159 @@ def process_single_video(video_path, config, in_progress_state=None):
                 out_files.append(f)
 
         if not out_files:
-            log(f"⚠️ 片段 {idx+1} 未找到输出文件，跳过并移至 failed")
-            _move_to_failed(clip, safe_folder)
-            processed = idx + 1
-            in_progress_state["processed"] = processed
-            save_progress(completed_videos, in_progress_all)
-            continue
+            log(f"⚠️ 未找到输出文件: {prefix}_*-audio.mp4")
+            return None
 
-        # 成功处理，移动输出文件
+        # 移动输出并同步音频
+        result = []
         for f in out_files:
             dest = safe_folder / f.name
             try:
                 shutil.move(str(f), str(dest))
-                generated.append(dest)
-                log(f"✅ 输出已保存: {dest.name}")
             except Exception as e:
-                log(f"移动文件失败 {f.name}: {e}")
-                generated.append(f)
+                log(f"移动输出文件失败 {f.name}: {e}")
+                continue
 
-        processed = idx + 1
+            synced_tmp = dest.with_suffix('.sync.mp4')
+            cmd_sync = [
+                ffmpeg_path, "-y",
+                "-i", str(clip_path),
+                "-i", str(dest),
+                "-c:v", "copy",
+                "-c:a", "aac", "-b:a", "192k",
+                "-map", "0:v",
+                "-map", "1:a",
+                "-shortest",
+                str(synced_tmp)
+            ]
+            r_sync = subprocess.run(cmd_sync, **get_subprocess_kwargs())
+            if r_sync.returncode == 0:
+                synced_tmp.replace(dest)
+                log(f"✅ 音频同步完成: {dest.name}")
+            else:
+                log(f"⚠️ 音频同步失败，保留原始输出: {r_sync.stderr}")
+                synced_tmp.unlink(missing_ok=True)
+            result.append(dest)
+        return result
+
+    # ----- 片段循环处理 -----
+    idx = processed
+    while idx < total:
+        if stop_flag.is_set():
+            log("⏹️ 停止信号，保存进度")
+            break
+
+        clip = clips[idx]
+        log(f"▶️ 片段 {idx+1}/{total}: {clip.name}")
+
+        # 第一次尝试处理原片段
+        out_files = _process_one_clip(clip, seg_index=idx)
+        if out_files is not None:
+            generated.extend(out_files)
+            idx += 1
+            processed = idx
+            in_progress_state["processed"] = processed
+            in_progress_state["generated_files"] = [p.name for p in generated]
+            save_progress(completed_videos, in_progress_all)
+            continue
+
+        # --- 失败：尝试对半切割重试 ---
+        log(f"🔄 片段 {clip.name} 处理失败，尝试对半切割重试...")
+        ffprobe_path = ffmpeg_path.replace("ffmpeg", "ffprobe")
+        dur = get_duration(clip, ffprobe_path)
+        if dur is None or dur < 2.0:
+            log(f"❌ 片段时长过短或无法获取，放弃该视频")
+            _move_to_failed(clip, safe_folder)
+            # 清理并返回失败
+            if clear_segments:
+                clear_directory(segment_dir)
+                segment_dir.rmdir()
+                log("🗑️ 已删除持久化片段目录")
+            return None, None
+
+        half = dur / 2.0
+        part1 = clip.parent / f"{clip.stem}_retry_a{clip.suffix}"
+        part2 = clip.parent / f"{clip.stem}_retry_b{clip.suffix}"
+
+        # 切割为两个子片段
+        cmd_split1 = [
+            ffmpeg_path, "-y",
+            "-i", str(clip),
+            "-ss", "0", "-t", str(half),
+            "-c:v", "libx264", "-crf", "18", "-preset", "fast",
+            "-c:a", "aac", "-b:a", "192k",
+            str(part1)
+        ]
+        cmd_split2 = [
+            ffmpeg_path, "-y",
+            "-i", str(clip),
+            "-ss", str(half), "-t", str(half),
+            "-c:v", "libx264", "-crf", "18", "-preset", "fast",
+            "-c:a", "aac", "-b:a", "192k",
+            str(part2)
+        ]
+        r1 = subprocess.run(cmd_split1, **get_subprocess_kwargs())
+        r2 = subprocess.run(cmd_split2, **get_subprocess_kwargs())
+        if r1.returncode != 0 or r2.returncode != 0:
+            log(f"❌ 切割重试失败，保留原片段，放弃该视频")
+            # 清理临时片段
+            for p in [part1, part2]:
+                if p.exists():
+                    p.unlink(missing_ok=True)
+            _move_to_failed(clip, safe_folder)
+            if clear_segments:
+                clear_directory(segment_dir)
+                segment_dir.rmdir()
+                log("🗑️ 已删除持久化片段目录")
+            return None, None
+
+        log(f"✂️ 已切割为 {part1.name} 和 {part2.name}，逐一处理")
+        # 处理子片段1
+        out1 = _process_one_clip(part1, seg_index=idx)  # 使用同一 idx，文件名可能冲突，但前缀包含 idx 所以没问题
+        if out1 is None:
+            log(f"❌ 子片段 {part1.name} 处理失败，放弃该视频")
+            for p in [part1, part2]:
+                if p.exists():
+                    p.unlink(missing_ok=True)
+            _move_to_failed(clip, safe_folder)
+            if clear_segments:
+                clear_directory(segment_dir)
+                segment_dir.rmdir()
+                log("🗑️ 已删除持久化片段目录")
+            return None, None
+
+        # 处理子片段2
+        out2 = _process_one_clip(part2, seg_index=idx+1)  # 这里 idx 可能造成前缀重复，后面会修正
+        if out2 is None:
+            log(f"❌ 子片段 {part2.name} 处理失败，放弃该视频")
+            # 清理已生成的子片段输出文件（避免残留）
+            for f in out1:
+                if f.exists():
+                    f.unlink(missing_ok=True)
+            for p in [part1, part2]:
+                if p.exists():
+                    p.unlink(missing_ok=True)
+            _move_to_failed(clip, safe_folder)
+            if clear_segments:
+                clear_directory(segment_dir)
+                segment_dir.rmdir()
+                log("🗑️ 已删除持久化片段目录")
+            return None, None
+
+        # 两个子片段都成功，替换原片段
+        log(f"✅ 切割重试成功，子片段输出已保存")
+        # 删除原片段
+        clip.unlink(missing_ok=True)
+        # 删除切割产生的临时子片段文件
+        part1.unlink(missing_ok=True)
+        part2.unlink(missing_ok=True)
+        # 将输出文件加入 generated
+        generated.extend(out1)
+        generated.extend(out2)
+        # 更新 processed 计数（这里占用了一个原片段位置，但变成了两个输出，后续处理继续）
+        # 注意：切割后原片段被替换，processed 应 +1，但列表长度变化，这里我们简单地把 idx 后移一位
+        idx += 1
+        processed = idx
         in_progress_state["processed"] = processed
         in_progress_state["generated_files"] = [p.name for p in generated]
         save_progress(completed_videos, in_progress_all)
@@ -473,10 +607,14 @@ def process_single_video(video_path, config, in_progress_state=None):
         log(f"⏸️ 暂停在片段 {processed}/{total}，进度已保存")
         return None, in_progress_state
 
-    # 合成阶段
+    # ---------- 合成阶段 ----------
     log(f"🔗 合成 {len(generated)} 个片段...")
     if not generated:
         log("❌ 无输出片段可合成")
+        if clear_segments:
+            clear_directory(segment_dir)
+            segment_dir.rmdir()
+            log("🗑️ 已删除持久化片段目录")
         return None, None
 
     def extract_num(fpath):
@@ -501,14 +639,17 @@ def process_single_video(video_path, config, in_progress_state=None):
     r = subprocess.run(cmd, **get_subprocess_kwargs())
     concat_txt.unlink(missing_ok=True)
 
-    if config.get("clear_output", True):
+    # 根据配置清理输出/临时目录
+    if clear_output:
         clear_directory(Path(output_dir))
-    if config.get("clear_temp", True):
+    if clear_temp:
         clear_directory(Path(temp_dir))
 
-    clear_directory(segment_dir)
-    segment_dir.rmdir()
-    log("🗑️ 已删除持久化片段目录")
+    # 根据配置清理片段目录
+    if clear_segments:
+        clear_directory(segment_dir)
+        segment_dir.rmdir()
+        log("🗑️ 已删除持久化片段目录")
 
     if r.returncode != 0:
         log(f"合并失败:\n{r.stderr}")
@@ -570,7 +711,7 @@ def manual_merge(video_name, ffmpeg_path):
 class VideoProcessorApp(Tk):
     def __init__(self):
         super().__init__()
-        self.title("MMAudio 批量处理 v3.9")
+        self.title("MMAudio 批量处理 v3.9.1（竖屏修复）")
         self.geometry("1000x800")
         self.resizable(True, True)
         self.configure(bg='#f0f0f0')

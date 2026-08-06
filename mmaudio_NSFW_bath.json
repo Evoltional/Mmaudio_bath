@@ -17,9 +17,9 @@
       ],
       "steps": 150,
       "cfg": 9,
-      "seed": 538186974295846,
-      "prompt": " soft youthful anime girl voice",
-      "negative_prompt": "music, singing, talking, speech, dialogue, male voice, background noise, dry sounds, quiet, calm，muffled voice",
+      "seed": 184852840990216,
+      "prompt": "soft youthful anime girl voice",
+      "negative_prompt": "music, singing, talking, speech, dialogue, male voice, background noise, dry sounds, quiet, calm, close-mic'd, intimate, whisper, ear-level, ASMR, muffled, boomy, low-pass, boxy, excessive bass, chest-only, dry sound, room reverb, hollow, telephone quality",
       "mask_away_clip": false,
       "force_offload": true,
       "mmaudio_model": [
@@ -54,7 +54,7 @@
       "save_metadata": false,
       "trim_to_audio": false,
       "pingpong": false,
-      "save_output": true,
+      "save_output": false,
       "images": [
         "110",
         0
@@ -71,7 +71,6 @@
   },
   "98": {
     "inputs": {
-      "audioUI": "",
       "audio": [
         "92",
         0
@@ -109,8 +108,8 @@
   },
   "110": {
     "inputs": {
-      "video": "\"D:\\Order\\DeskTop\\KF\\Me-Python\\Mmaudio_Bath\\temp_clips\\seg_000.mp4\"",
-      "force_rate": 24,
+      "video": "",
+      "force_rate": 0,
       "custom_width": 0,
       "custom_height": 0,
       "frame_load_cap": 0,
