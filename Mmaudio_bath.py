@@ -1,4 +1,5 @@
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -771,34 +772,68 @@ class VideoProcessorApp(Tk):
         save_config(new_config)
         self.config = new_config
 
+    def _open_folder(self, path_var):
+        """在资源管理器中打开路径所在的文件夹（如果是文件，则打开其父文件夹）"""
+        path = path_var.get().strip()
+        if not path:
+            messagebox.showwarning("路径为空", "请先设置路径")
+            return
+        p = Path(path)
+        if p.is_file():
+            folder = p.parent
+        else:
+            folder = p
+        if not folder.exists():
+            messagebox.showwarning("路径不存在", f"路径不存在: {folder}")
+            return
+        try:
+            if sys.platform == "win32":
+                os.startfile(str(folder))
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", str(folder)])
+            else:
+                subprocess.Popen(["xdg-open", str(folder)])
+        except Exception as e:
+            messagebox.showerror("打开失败", f"无法打开文件夹:\n{e}")
+
     def create_widgets(self):
         config_frame = ttk.LabelFrame(self, text=" 设置 ", padding=10)
         config_frame.pack(fill=X, padx=10, pady=10)
 
+        # Row 0: ComfyUI 地址
         ttk.Label(config_frame, text="ComfyUI 地址:", style='Header.TLabel').grid(row=0, column=0, sticky=W, padx=5, pady=5)
         self.comfy_url_var = StringVar(value=self.config["comfy_url"])
         ttk.Entry(config_frame, textvariable=self.comfy_url_var, width=40).grid(row=0, column=1, sticky=W, padx=5)
 
+        # Row 1: API 工作流
         ttk.Label(config_frame, text="API 工作流:", style='Header.TLabel').grid(row=1, column=0, sticky=W, padx=5, pady=5)
         self.workflow_path_var = StringVar(value=self.config["workflow_path"])
         ttk.Entry(config_frame, textvariable=self.workflow_path_var, width=50).grid(row=1, column=1, sticky=W, padx=5)
         ttk.Button(config_frame, text="浏览...", command=self.browse_workflow).grid(row=1, column=2, padx=5)
+        ttk.Button(config_frame, text="📂", width=3, command=lambda: self._open_folder(self.workflow_path_var)).grid(row=1, column=3, padx=2)
 
+        # Row 2: Output 目录
         ttk.Label(config_frame, text="Output 目录:", style='Header.TLabel').grid(row=2, column=0, sticky=W, padx=5, pady=5)
         self.output_dir_var = StringVar(value=self.config["output_dir"])
         ttk.Entry(config_frame, textvariable=self.output_dir_var, width=50).grid(row=2, column=1, sticky=W, padx=5)
         ttk.Button(config_frame, text="浏览...", command=self.browse_output).grid(row=2, column=2, padx=5)
+        ttk.Button(config_frame, text="📂", width=3, command=lambda: self._open_folder(self.output_dir_var)).grid(row=2, column=3, padx=2)
 
+        # Row 3: Temp 目录
         ttk.Label(config_frame, text="Temp 目录:", style='Header.TLabel').grid(row=3, column=0, sticky=W, padx=5, pady=5)
         self.temp_dir_var = StringVar(value=self.config["temp_dir"])
         ttk.Entry(config_frame, textvariable=self.temp_dir_var, width=50).grid(row=3, column=1, sticky=W, padx=5)
         ttk.Button(config_frame, text="浏览...", command=self.browse_temp).grid(row=3, column=2, padx=5)
+        ttk.Button(config_frame, text="📂", width=3, command=lambda: self._open_folder(self.temp_dir_var)).grid(row=3, column=3, padx=2)
 
+        # Row 4: FFmpeg 路径
         ttk.Label(config_frame, text="FFmpeg:", style='Header.TLabel').grid(row=4, column=0, sticky=W, padx=5, pady=5)
         self.ffmpeg_path_var = StringVar(value=self.config["ffmpeg_path"])
         ttk.Entry(config_frame, textvariable=self.ffmpeg_path_var, width=40).grid(row=4, column=1, sticky=W, padx=5)
         ttk.Button(config_frame, text="浏览...", command=self.browse_ffmpeg).grid(row=4, column=2, padx=5)
+        ttk.Button(config_frame, text="📂", width=3, command=lambda: self._open_folder(self.ffmpeg_path_var)).grid(row=4, column=3, padx=2)
 
+        # Row 5: 合成后清空开关
         ttk.Label(config_frame, text="合成后清空:", style='Header.TLabel').grid(row=5, column=0, sticky=W, padx=5, pady=10)
         switch_frame = ttk.Frame(config_frame)
         switch_frame.grid(row=5, column=1, sticky=W, padx=5)
@@ -806,6 +841,7 @@ class VideoProcessorApp(Tk):
         ttk.Checkbutton(switch_frame, text="temp", variable=self.clear_temp_var).pack(side=LEFT, padx=5)
         ttk.Checkbutton(switch_frame, text="segments", variable=self.clear_segments_var).pack(side=LEFT, padx=5)
 
+        # 控制栏
         control_frame = ttk.Frame(self)
         control_frame.pack(fill=X, padx=10, pady=5)
 
@@ -819,9 +855,11 @@ class VideoProcessorApp(Tk):
         self.progress_bar = Progressbar(control_frame, orient="horizontal", mode="indeterminate")
         self.progress_bar.pack(side=RIGHT, padx=10, fill=X, expand=True)
 
+        # 主内容区
         main_frame = ttk.Frame(self)
         main_frame.pack(fill=BOTH, expand=True, padx=10, pady=5)
 
+        # 左侧：待处理视频列表
         list_frame = ttk.LabelFrame(main_frame, text=" 待处理视频 ", padding=5)
         list_frame.pack(side=LEFT, fill=BOTH, expand=True)
 
@@ -831,6 +869,7 @@ class VideoProcessorApp(Tk):
         list_scroll.pack(side=RIGHT, fill=Y)
         self.listbox.config(yscrollcommand=list_scroll.set)
 
+        # 中间：未合成视频列表
         incomplete_frame = ttk.LabelFrame(main_frame, text=" 未合成视频 (可手动合成) ", padding=5)
         incomplete_frame.pack(side=LEFT, fill=BOTH, expand=True, padx=(5,0))
 
@@ -839,6 +878,7 @@ class VideoProcessorApp(Tk):
         btn_merge = ttk.Button(incomplete_frame, text="🔧 合成选中视频", command=self.manual_merge_selected)
         btn_merge.pack(pady=5)
 
+        # 右侧：实时日志
         log_frame = ttk.LabelFrame(main_frame, text=" 实时日志 ", padding=5)
         log_frame.pack(side=RIGHT, fill=BOTH, expand=True)
 
