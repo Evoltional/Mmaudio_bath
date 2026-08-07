@@ -418,13 +418,8 @@ def process_single_video(video_path, config, in_progress_state=None):
 
     # ----- 内部函数：处理单个视频片段，返回生成的文件列表，失败返回 None -----
     def _process_one_clip(clip_path, seg_index=None):
-        """
-        提交片段到 ComfyUI，将输出文件移至 safe_folder 并完成音频同步。
-        成功返回 [Path, ...]，失败返回 None。
-        """
         nonlocal prompt_template, load_id, combine_id, comfy_url, output_dir, temp_dir, ffmpeg_path, safe_folder
 
-        # 生成唯一前缀，避免文件冲突
         prefix = f"MMaudio_seg_{seg_index:03d}" if seg_index is not None else f"MMaudio_{uuid.uuid4().hex[:6]}"
         prompt_template[load_id]["inputs"]["video"] = str(clip_path)
         prompt_template[combine_id]["inputs"]["filename_prefix"] = prefix
@@ -449,7 +444,6 @@ def process_single_video(video_path, config, in_progress_state=None):
             log(f"⚠️ 未找到输出文件: {prefix}_*-audio.mp4")
             return None
 
-        # 移动输出并同步音频
         result = []
         for f in out_files:
             dest = safe_folder / f.name
@@ -491,7 +485,6 @@ def process_single_video(video_path, config, in_progress_state=None):
         clip = clips[idx]
         log(f"▶️ 片段 {idx+1}/{total}: {clip.name}")
 
-        # 第一次尝试处理原片段
         out_files = _process_one_clip(clip, seg_index=idx)
         if out_files is not None:
             generated.extend(out_files)
@@ -509,7 +502,6 @@ def process_single_video(video_path, config, in_progress_state=None):
         if dur is None or dur < 2.0:
             log(f"❌ 片段时长过短或无法获取，放弃该视频")
             _move_to_failed(clip, safe_folder)
-            # 清理并返回失败
             if clear_segments:
                 clear_directory(segment_dir)
                 segment_dir.rmdir()
@@ -520,7 +512,6 @@ def process_single_video(video_path, config, in_progress_state=None):
         part1 = clip.parent / f"{clip.stem}_retry_a{clip.suffix}"
         part2 = clip.parent / f"{clip.stem}_retry_b{clip.suffix}"
 
-        # 切割为两个子片段
         cmd_split1 = [
             ffmpeg_path, "-y",
             "-i", str(clip),
@@ -541,7 +532,6 @@ def process_single_video(video_path, config, in_progress_state=None):
         r2 = subprocess.run(cmd_split2, **get_subprocess_kwargs())
         if r1.returncode != 0 or r2.returncode != 0:
             log(f"❌ 切割重试失败，保留原片段，放弃该视频")
-            # 清理临时片段
             for p in [part1, part2]:
                 if p.exists():
                     p.unlink(missing_ok=True)
@@ -553,8 +543,7 @@ def process_single_video(video_path, config, in_progress_state=None):
             return None, None
 
         log(f"✂️ 已切割为 {part1.name} 和 {part2.name}，逐一处理")
-        # 处理子片段1
-        out1 = _process_one_clip(part1, seg_index=idx)  # 使用同一 idx，文件名可能冲突，但前缀包含 idx 所以没问题
+        out1 = _process_one_clip(part1, seg_index=idx)
         if out1 is None:
             log(f"❌ 子片段 {part1.name} 处理失败，放弃该视频")
             for p in [part1, part2]:
@@ -567,11 +556,9 @@ def process_single_video(video_path, config, in_progress_state=None):
                 log("🗑️ 已删除持久化片段目录")
             return None, None
 
-        # 处理子片段2
-        out2 = _process_one_clip(part2, seg_index=idx+1)  # 这里 idx 可能造成前缀重复，后面会修正
+        out2 = _process_one_clip(part2, seg_index=idx+1)
         if out2 is None:
             log(f"❌ 子片段 {part2.name} 处理失败，放弃该视频")
-            # 清理已生成的子片段输出文件（避免残留）
             for f in out1:
                 if f.exists():
                     f.unlink(missing_ok=True)
@@ -585,25 +572,18 @@ def process_single_video(video_path, config, in_progress_state=None):
                 log("🗑️ 已删除持久化片段目录")
             return None, None
 
-        # 两个子片段都成功，替换原片段
         log(f"✅ 切割重试成功，子片段输出已保存")
-        # 删除原片段
         clip.unlink(missing_ok=True)
-        # 删除切割产生的临时子片段文件
         part1.unlink(missing_ok=True)
         part2.unlink(missing_ok=True)
-        # 将输出文件加入 generated
         generated.extend(out1)
         generated.extend(out2)
-        # 更新 processed 计数（这里占用了一个原片段位置，但变成了两个输出，后续处理继续）
-        # 注意：切割后原片段被替换，processed 应 +1，但列表长度变化，这里我们简单地把 idx 后移一位
         idx += 1
         processed = idx
         in_progress_state["processed"] = processed
         in_progress_state["generated_files"] = [p.name for p in generated]
         save_progress(completed_videos, in_progress_all)
 
-    # 循环结束后判断
     if stop_flag.is_set() or processed < total:
         log(f"⏸️ 暂停在片段 {processed}/{total}，进度已保存")
         return None, in_progress_state
@@ -623,22 +603,27 @@ def process_single_video(video_path, config, in_progress_state=None):
         return int(m.group(1)) if m else 0
 
     generated.sort(key=extract_num)
-    concat_txt = SCRIPT_DIR / "concat.txt"
-    with open(concat_txt, "w", encoding="utf-8") as f:
-        for gf in generated:
-            f.write(f"file '{gf.as_posix()}'\n")
+
+    # ---- 使用 concat filter 替代 concat demuxer，消除编码不一致问题 ----
+    inputs = []
+    filter_parts = []
+    for i, gf in enumerate(generated):
+        inputs.extend(['-i', str(gf)])
+        filter_parts.append(f'[{i}:v:0][{i}:a:0]')
+
+    concat_filter = ''.join(filter_parts) + f'concat=n={len(generated)}:v=1:a=1[outv][outa]'
 
     final = FINISH_DIR / f"{video_path.stem}.mp4"
     cmd = [
-        ffmpeg_path, "-y",
-        "-f", "concat", "-safe", "0",
-        "-i", str(concat_txt),
-        "-c:v", "libx264", "-crf", "18", "-preset", "medium",
-        "-c:a", "aac", "-b:a", "192k",
+        ffmpeg_path, '-y',
+        *inputs,
+        '-filter_complex', concat_filter,
+        '-map', '[outv]', '-map', '[outa]',
+        '-c:v', 'libx264', '-crf', '18', '-preset', 'medium',
+        '-c:a', 'aac', '-b:a', '192k',
         str(final)
     ]
     r = subprocess.run(cmd, **get_subprocess_kwargs())
-    concat_txt.unlink(missing_ok=True)
 
     # 根据配置清理输出/临时目录
     if clear_output:
@@ -646,7 +631,6 @@ def process_single_video(video_path, config, in_progress_state=None):
     if clear_temp:
         clear_directory(Path(temp_dir))
 
-    # 根据配置清理片段目录
     if clear_segments:
         clear_directory(segment_dir)
         segment_dir.rmdir()
@@ -659,7 +643,7 @@ def process_single_video(video_path, config, in_progress_state=None):
     log(f"🎉 合成成功: {final.name}")
     return final, None
 
-# ================= 手动合成功能 =================
+# ================= 手动合成功能（同样改用 concat filter） =================
 def manual_merge(video_name, ffmpeg_path):
     safe_folder = FINISH_DIR / video_name
     if not safe_folder.exists() or not safe_folder.is_dir():
@@ -677,22 +661,25 @@ def manual_merge(video_name, ffmpeg_path):
 
     clips.sort(key=extract_num)
 
-    concat_txt = SCRIPT_DIR / f"concat_{video_name}.txt"
-    with open(concat_txt, "w", encoding="utf-8") as f:
-        for cl in clips:
-            f.write(f"file '{cl.as_posix()}'\n")
+    inputs = []
+    filter_parts = []
+    for i, cl in enumerate(clips):
+        inputs.extend(['-i', str(cl)])
+        filter_parts.append(f'[{i}:v:0][{i}:a:0]')
+
+    concat_filter = ''.join(filter_parts) + f'concat=n={len(clips)}:v=1:a=1[outv][outa]'
 
     output_path = FINISH_DIR / f"{video_name}.mp4"
     cmd = [
-        ffmpeg_path, "-y",
-        "-f", "concat", "-safe", "0",
-        "-i", str(concat_txt),
-        "-c:v", "libx264", "-crf", "18", "-preset", "medium",
-        "-c:a", "aac", "-b:a", "192k",
+        ffmpeg_path, '-y',
+        *inputs,
+        '-filter_complex', concat_filter,
+        '-map', '[outv]', '-map', '[outa]',
+        '-c:v', 'libx264', '-crf', '18', '-preset', 'medium',
+        '-c:a', 'aac', '-b:a', '192k',
         str(output_path)
     ]
     r = subprocess.run(cmd, **get_subprocess_kwargs())
-    concat_txt.unlink(missing_ok=True)
 
     if r.returncode == 0:
         log(f"🎉 手动合成成功: {output_path.name}")
@@ -712,7 +699,7 @@ def manual_merge(video_name, ffmpeg_path):
 class VideoProcessorApp(Tk):
     def __init__(self):
         super().__init__()
-        self.title("MMAudio 批量处理 v3.9.1（竖屏修复）")
+        self.title("MMAudio 批量处理 v3.9.2（合成修复版）")
         self.geometry("1000x800")
         self.resizable(True, True)
         self.configure(bg='#f0f0f0')
@@ -773,7 +760,6 @@ class VideoProcessorApp(Tk):
         self.config = new_config
 
     def _open_folder(self, path_var):
-        """在资源管理器中打开路径所在的文件夹（如果是文件，则打开其父文件夹）"""
         path = path_var.get().strip()
         if not path:
             messagebox.showwarning("路径为空", "请先设置路径")
@@ -800,40 +786,34 @@ class VideoProcessorApp(Tk):
         config_frame = ttk.LabelFrame(self, text=" 设置 ", padding=10)
         config_frame.pack(fill=X, padx=10, pady=10)
 
-        # Row 0: ComfyUI 地址
         ttk.Label(config_frame, text="ComfyUI 地址:", style='Header.TLabel').grid(row=0, column=0, sticky=W, padx=5, pady=5)
         self.comfy_url_var = StringVar(value=self.config["comfy_url"])
         ttk.Entry(config_frame, textvariable=self.comfy_url_var, width=40).grid(row=0, column=1, sticky=W, padx=5)
 
-        # Row 1: API 工作流
         ttk.Label(config_frame, text="API 工作流:", style='Header.TLabel').grid(row=1, column=0, sticky=W, padx=5, pady=5)
         self.workflow_path_var = StringVar(value=self.config["workflow_path"])
         ttk.Entry(config_frame, textvariable=self.workflow_path_var, width=50).grid(row=1, column=1, sticky=W, padx=5)
         ttk.Button(config_frame, text="浏览...", command=self.browse_workflow).grid(row=1, column=2, padx=5)
         ttk.Button(config_frame, text="📂", width=3, command=lambda: self._open_folder(self.workflow_path_var)).grid(row=1, column=3, padx=2)
 
-        # Row 2: Output 目录
         ttk.Label(config_frame, text="Output 目录:", style='Header.TLabel').grid(row=2, column=0, sticky=W, padx=5, pady=5)
         self.output_dir_var = StringVar(value=self.config["output_dir"])
         ttk.Entry(config_frame, textvariable=self.output_dir_var, width=50).grid(row=2, column=1, sticky=W, padx=5)
         ttk.Button(config_frame, text="浏览...", command=self.browse_output).grid(row=2, column=2, padx=5)
         ttk.Button(config_frame, text="📂", width=3, command=lambda: self._open_folder(self.output_dir_var)).grid(row=2, column=3, padx=2)
 
-        # Row 3: Temp 目录
         ttk.Label(config_frame, text="Temp 目录:", style='Header.TLabel').grid(row=3, column=0, sticky=W, padx=5, pady=5)
         self.temp_dir_var = StringVar(value=self.config["temp_dir"])
         ttk.Entry(config_frame, textvariable=self.temp_dir_var, width=50).grid(row=3, column=1, sticky=W, padx=5)
         ttk.Button(config_frame, text="浏览...", command=self.browse_temp).grid(row=3, column=2, padx=5)
         ttk.Button(config_frame, text="📂", width=3, command=lambda: self._open_folder(self.temp_dir_var)).grid(row=3, column=3, padx=2)
 
-        # Row 4: FFmpeg 路径
         ttk.Label(config_frame, text="FFmpeg:", style='Header.TLabel').grid(row=4, column=0, sticky=W, padx=5, pady=5)
         self.ffmpeg_path_var = StringVar(value=self.config["ffmpeg_path"])
         ttk.Entry(config_frame, textvariable=self.ffmpeg_path_var, width=40).grid(row=4, column=1, sticky=W, padx=5)
         ttk.Button(config_frame, text="浏览...", command=self.browse_ffmpeg).grid(row=4, column=2, padx=5)
         ttk.Button(config_frame, text="📂", width=3, command=lambda: self._open_folder(self.ffmpeg_path_var)).grid(row=4, column=3, padx=2)
 
-        # Row 5: 合成后清空开关
         ttk.Label(config_frame, text="合成后清空:", style='Header.TLabel').grid(row=5, column=0, sticky=W, padx=5, pady=10)
         switch_frame = ttk.Frame(config_frame)
         switch_frame.grid(row=5, column=1, sticky=W, padx=5)
@@ -841,7 +821,6 @@ class VideoProcessorApp(Tk):
         ttk.Checkbutton(switch_frame, text="temp", variable=self.clear_temp_var).pack(side=LEFT, padx=5)
         ttk.Checkbutton(switch_frame, text="segments", variable=self.clear_segments_var).pack(side=LEFT, padx=5)
 
-        # 控制栏
         control_frame = ttk.Frame(self)
         control_frame.pack(fill=X, padx=10, pady=5)
 
@@ -855,11 +834,9 @@ class VideoProcessorApp(Tk):
         self.progress_bar = Progressbar(control_frame, orient="horizontal", mode="indeterminate")
         self.progress_bar.pack(side=RIGHT, padx=10, fill=X, expand=True)
 
-        # 主内容区
         main_frame = ttk.Frame(self)
         main_frame.pack(fill=BOTH, expand=True, padx=10, pady=5)
 
-        # 左侧：待处理视频列表
         list_frame = ttk.LabelFrame(main_frame, text=" 待处理视频 ", padding=5)
         list_frame.pack(side=LEFT, fill=BOTH, expand=True)
 
@@ -869,7 +846,6 @@ class VideoProcessorApp(Tk):
         list_scroll.pack(side=RIGHT, fill=Y)
         self.listbox.config(yscrollcommand=list_scroll.set)
 
-        # 中间：未合成视频列表
         incomplete_frame = ttk.LabelFrame(main_frame, text=" 未合成视频 (可手动合成) ", padding=5)
         incomplete_frame.pack(side=LEFT, fill=BOTH, expand=True, padx=(5,0))
 
@@ -878,7 +854,6 @@ class VideoProcessorApp(Tk):
         btn_merge = ttk.Button(incomplete_frame, text="🔧 合成选中视频", command=self.manual_merge_selected)
         btn_merge.pack(pady=5)
 
-        # 右侧：实时日志
         log_frame = ttk.LabelFrame(main_frame, text=" 实时日志 ", padding=5)
         log_frame.pack(side=RIGHT, fill=BOTH, expand=True)
 
