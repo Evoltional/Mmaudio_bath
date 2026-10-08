@@ -21,7 +21,7 @@ import requests
 # ================= 默认配置 =================
 DEFAULT_CONFIG = {
     "comfy_url": "http://127.0.0.1:8188",
-    "workflow_path": r"D:\Order\DeskTop\KF\Me-Python\Mmaudio_Bath\mmaudio_NSFW_bath.json",
+    "workflow_path": r"D:\Order\DeskTop\KF\Mmaudio_bath\mmaudio_NSFW_bath_with_api.json",
     "output_dir": r"E:\Ordrnary\ComfyUI-aki-v3\ComfyUI\output",
     "temp_dir": r"E:\Ordrnary\ComfyUI-aki-v3\ComfyUI\temp",
     "ffmpeg_path": "ffmpeg",
@@ -29,10 +29,8 @@ DEFAULT_CONFIG = {
     "clear_temp": True,
     "clear_segments": True
 }
-SEGMENT_DURATION = 5
-MAX_SEGMENT_DURATION = 9          # 超过则对半切割
-MIN_MERGE_DURATION = 5            # 小于此值尝试合并
-MAX_MERGED_DURATION = 9           # 合并后总时长上限
+SEGMENT_WINDOW = 7.0              # 基础窗口长度(秒)。12GB 显存下 10s 会 OOM，7s 留 ~2.3GB 余量安全；想更长可试 8s
+OVERLAP = 2.0                     # 窗口重叠秒数；回到 2.0 给交叉淡化更长的混合区间，配合 cosine 等功率淡化消除接缝处的音量凹陷/卡顿
 SCRIPT_DIR = Path.cwd()
 CONFIG_FILE = SCRIPT_DIR / "config.json"
 PROGRESS_FILE = SCRIPT_DIR / "progress.json"
@@ -159,181 +157,203 @@ def clear_directory(path):
             shutil.rmtree(item, ignore_errors=True)
     log(f"🧹 已清空目录: {path}")
 
-# ================= 合并短视频 =================
-def _merge_two_clips(clip1, clip2, ffmpeg_path, output_dir):
-    merged_name = f"{clip1.stem}_m{clip2.stem}{clip1.suffix}"
-    merged_path = output_dir / merged_name
-    cmd = [
-        ffmpeg_path, "-y",
-        "-i", str(clip1),
-        "-i", str(clip2),
-        "-filter_complex", "[0:v][0:a][1:v][1:a]concat=n=2:v=1:a=1[outv][outa]",
-        "-map", "[outv]", "-map", "[outa]",
-        "-c:v", "libx264", "-crf", "18", "-preset", "fast",
-        "-c:a", "aac", "-b:a", "192k",
-        str(merged_path)
-    ]
-    r = subprocess.run(cmd, **get_subprocess_kwargs())
-    if r.returncode != 0:
-        log(f"合并 {clip1.name} 与 {clip2.name} 失败:\n{r.stderr}")
-        return None
-    log(f"🔀 合并: {clip1.name} + {clip2.name} -> {merged_name}")
-    return merged_path
 
-def merge_short_clips(clips, ffmpeg_path, ffprobe_path, output_dir):
-    def is_half_segment(clip):
-        stem = clip.stem
-        return stem[-1] in 'ab' and stem[-2:].isdigit()
+# ================= 交叉淡化合成（无缝音频） =================
+def assemble_crossfade(video_path, wav_list, ffmpeg_path, output_path, overlap):
+    """将有序的窗口音频做交叉淡化，再与原视频 mux（视频仅复制一次，避免反复重编码）。
 
-    def can_merge(clip):
-        return not is_half_segment(clip)
+    采用平衡二叉树合并：每次只把相邻两段做一次 acrossfade，深度仅 log2(N) 层，
+    相比原先把 N 段串成一条线性 acrossfade 长链（78 个节点串接），时长与内存都有界，
+    且每个原始边界都只交叉淡化一次，效果与线性链逐边界完全一致。
 
-    clip_info = []
-    for c in clips:
-        dur = get_duration(c, ffprobe_path)
-        if dur is None:
-            dur = 0
-        clip_info.append({"path": c, "duration": dur, "half": is_half_segment(c)})
+    重要：ffmpeg 的 acrossfade 在「第二段明显短于第一段」时会输出错误长度，
+    因此当第二段较短时，先用 apad 把第二段补长到与第一段等长，crossfade 后再
+    atrim 回精确时长，从而既保住时间顺序又绕开该 ffmpeg bug。
+    """
+    if not wav_list:
+        return False
+    n = len(wav_list)
 
-    changed = True
-    while changed:
-        changed = False
-        i = 0
-        while i < len(clip_info):
-            cur = clip_info[i]
-            if cur["duration"] >= MIN_MERGE_DURATION or not can_merge(cur["path"]):
-                i += 1
-                continue
-            prev = clip_info[i-1] if i > 0 else None
-            next_ = clip_info[i+1] if i < len(clip_info)-1 else None
-
-            candidates = []
-            if prev and can_merge(prev["path"]):
-                candidates.append(prev)
-            if next_ and can_merge(next_["path"]):
-                candidates.append(next_)
-            if not candidates:
-                i += 1
-                continue
-
-            target = min(candidates, key=lambda x: x["duration"])
-            combined_duration = cur["duration"] + target["duration"]
-            if combined_duration >= MAX_MERGED_DURATION:
-                i += 1
-                continue
-
-            new_path = _merge_two_clips(cur["path"], target["path"], ffmpeg_path, output_dir)
-            if new_path is None:
-                i += 1
-                continue
-
-            try:
-                cur["path"].unlink(missing_ok=True)
-                target["path"].unlink(missing_ok=True)
-            except:
-                pass
-
-            if target == prev:
-                del clip_info[i]
-                del clip_info[i-1]
-                new_dur = get_duration(new_path, ffprobe_path) or combined_duration
-                clip_info.insert(i-1, {"path": new_path, "duration": new_dur, "half": False})
-                i -= 1
-            else:
-                del clip_info[i+1]
-                del clip_info[i]
-                new_dur = get_duration(new_path, ffprobe_path) or combined_duration
-                clip_info.insert(i, {"path": new_path, "duration": new_dur, "half": False})
-            changed = True
-    return [info["path"] for info in clip_info]
-
-# ================= 视频分割 =================
-def split_video(input_path, dur, ffmpeg_path, output_dir):
-    output_dir.mkdir(parents=True, exist_ok=True)
-    pattern = str(output_dir / "seg_%03d.mp4")
-    safe_input = output_dir / f"input_{uuid.uuid4().hex}.mp4"
-    try:
-        shutil.copy2(str(input_path), str(safe_input))
-    except Exception as e:
-        log(f"❌ 复制视频失败: {e}")
-        return None
-
-    cmd = [
-        ffmpeg_path,
-        "-i", str(safe_input),
-        "-c", "copy",
-        "-map", "0:v",
-        "-map", "0:a?",
-        "-dn",
-        "-segment_time", str(dur),
-        "-f", "segment",
-        "-reset_timestamps", "1",
-        pattern
-    ]
-    r = subprocess.run(cmd, **get_subprocess_kwargs())
-    safe_input.unlink(missing_ok=True)
-    if r.returncode != 0:
-        err_msg = r.stderr.strip() or r.stdout.strip() or "未知错误"
-        log(f"初次分割失败:\n{err_msg}")
-        return None
-
-    clips = sorted(output_dir.glob("seg_*.mp4"))
-    log(f"✅ 初次分割完成，共 {len(clips)} 段")
+    if n == 1:
+        cmd = [ffmpeg_path, "-y", "-i", str(video_path), "-i", str(wav_list[0]),
+               "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+               "-map", "0:v:0", "-map", "1:a:0", "-shortest", str(output_path)]
+        r = subprocess.run(cmd, **get_subprocess_kwargs())
+        return r.returncode == 0
 
     ffprobe_path = ffmpeg_path.replace("ffmpeg", "ffprobe")
-    processed_clips = []
-    for clip in clips:
-        duration = get_duration(clip, ffprobe_path)
-        if duration is None:
-            log(f"⚠️ 无法获取 {clip.name} 时长，保留原片段")
-            processed_clips.append(clip)
-            continue
+    # 仅在此处对原始段做一次 ffprobe；合并过程中时长按解析公式推算，
+    # 不再反复探测临时文件，避免高频子进程拖慢与句柄争用。
+    durs = [get_duration(w, ffprobe_path) or 0.0 for w in wav_list]
+    items = [(Path(w), d) for w, d in zip(wav_list, durs)]
 
-        if duration < MAX_SEGMENT_DURATION:
-            processed_clips.append(clip)
+    tmp_root = output_path.parent / (output_path.stem + "_cf_tmp")
+    try:
+        tmp_root.mkdir(parents=True, exist_ok=True)
+        level = 0
+        while len(items) > 1:
+            merged = []
+            for i in range(0, len(items), 2):
+                a, da = items[i]
+                if i + 1 < len(items):
+                    b, db = items[i + 1]
+                    # 交叉淡化时长（保证不超过任一段可用长度）
+                    d = overlap
+                    if min(da, db) <= d + 0.05:
+                        d = max(0.1, min(da, db) - 0.1)
+                    if d < 0.15:
+                        # 退化：直接拼接（极少出现）
+                        flt = "[0:a:0][1:a:0]concat=v=0:a=1[out]"
+                        nd = da + db
+                    else:
+                        if db < da:
+                            # 第二段较短会触发 ffmpeg acrossfade 长度错误：
+                            # 先把第二段补长到与第一段等长，结束后裁回精确时长。
+                            flt = (f"[1:a:0]apad=whole_dur={da:.3f}[bpad];"
+                                   f"[0:a:0][bpad]acrossfade=d={d:.3f}:curve=cos[out];"
+                                   f"[out]atrim=0:{da + db - d:.3f}[out]")
+                        else:
+                            flt = f"[0:a:0][1:a:0]acrossfade=d={d:.3f}:curve=cos[out]"
+                        nd = da + db - d
+                    outp = tmp_root / f"m{level}_{i // 2:03d}.wav"
+                    cmd = [ffmpeg_path, "-y", "-i", str(a), "-i", str(b),
+                           "-filter_complex", flt,
+                           "-map", "[out]", "-c:a", "pcm_s16le", str(outp)]
+                    r = subprocess.run(cmd, **get_subprocess_kwargs())
+                    if r.returncode != 0:
+                        log(f"❌ 交叉淡化合并失败: {a.name} + {b.name}")
+                        return False
+                    merged.append((outp, nd))
+                else:
+                    merged.append((a, da))  # 奇数个时落单的一段直接进位
+            items = merged
+            level += 1
+            log(f"🔗 交叉淡化合并 第 {level} 层，剩余 {len(items)} 段")
+
+        final_audio, final_dur = items[0]
+        # ---- 与原视频 mux（视频仅复制一次）----
+        # 用解析推算的精确时长 -t 截断，避免部分 ffmpeg 下 -shortest 行为异常导致时长错乱。
+        cmd = [ffmpeg_path, "-y", "-i", str(video_path), "-i", str(final_audio),
+               "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+               "-map", "0:v:0", "-map", "1:a:0", "-t", f"{final_dur:.3f}", str(output_path)]
+        r = subprocess.run(cmd, **get_subprocess_kwargs())
+        if r.returncode != 0:
+            log(f"交叉淡化合成失败:\n{r.stderr}")
+            return False
+        return True
+    finally:
+        shutil.rmtree(tmp_root, ignore_errors=True)
+
+# ================= 视频分割（重叠窗口，优先流复制） =================
+def split_overlap_windows(input_path, window, overlap, ffmpeg_path, output_dir):
+    """按重叠窗口切割长视频：窗口=window 秒，相邻窗口重叠 overlap 秒。
+    优先用流复制(-c copy)避免逐窗口重编码：起始点吸附到关键帧，保证切割
+    落在关键帧上且窗口递进、彼此重叠。若源关键帧过疏无法保证重叠，则先
+    一次性转码为“密集关键帧”中间文件（仅一次），再流复制切割。
+    返回有序的窗口视频路径列表（命名 win_000.mp4 ...）。"""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    ffprobe_path = ffmpeg_path.replace("ffmpeg", "ffprobe")
+    total = get_duration(input_path, ffprobe_path)
+    if total is None:
+        log("❌ 无法获取视频时长，放弃切割")
+        return None
+
+    step = window - overlap
+    if step <= 0:
+        step = max(0.5, window / 2.0)
+
+    # ---- 探测关键帧时间戳 ----
+    def get_keyframes(path):
+        try:
+            cmd = [ffprobe_path, "-v", "error",
+                   "-select_streams", "v:0",
+                   "-show_entries", "frame=pts_time",
+                   "-skip_frame", "nokey",
+                   "-of", "csv=p=0", str(path)]
+            r = subprocess.run(cmd, **get_subprocess_kwargs())
+            if r.returncode == 0 and r.stdout.strip():
+                return sorted(float(x) for x in r.stdout.strip().splitlines() if x.strip())
+        except Exception as e:
+            log(f"关键帧探测失败: {e}")
+        return []
+
+    def is_dense(kfs):
+        """相邻关键帧间隔 ≤ step 时，吸附后能产出递进且重叠的窗口"""
+        if len(kfs) < 2:
+            return False
+        return max(kfs[i+1] - kfs[i] for i in range(len(kfs)-1)) <= step + 1e-3
+
+    src_for_cut = input_path
+    keyframes = get_keyframes(input_path)
+    force_reencode = False
+
+    if not is_dense(keyframes):
+        # 源关键帧过疏：一次性转码为密集关键帧（每 0.5s 一个）中间文件，仅做一次
+        tmp_src = output_dir / "_keyed.mp4"
+        log(f"⚠️ 源关键帧间隔过大，先转码为密集关键帧中间文件（仅一次，避免逐窗口重编码）")
+        cmd = [ffmpeg_path, "-y", "-i", str(input_path),
+               "-c:v", "libx264", "-crf", "18", "-preset", "fast",
+               "-force_key_frames", "expr:gte(t,n_forced*0.5)",
+               "-c:a", "copy", str(tmp_src)]
+        r = subprocess.run(cmd, **get_subprocess_kwargs())
+        if r.returncode != 0:
+            log(f"❌ 密集关键帧转码失败，回退为逐窗口重编码:\n{r.stderr}")
+            force_reencode = True
         else:
-            log(f"⏳ {clip.name} 时长 {duration:.1f}s，超过 {MAX_SEGMENT_DURATION}s，对半重编码切割...")
-            half = duration / 2.0
-            part1 = clip.parent / f"{clip.stem}a{clip.suffix}"
-            part2 = clip.parent / f"{clip.stem}b{clip.suffix}"
-
-            cmd1 = [
-                ffmpeg_path, "-y",
-                "-i", str(clip),
-                "-ss", "0", "-t", str(half),
-                "-c:v", "libx264", "-crf", "18", "-preset", "fast",
-                "-c:a", "aac", "-b:a", "192k",
-                str(part1)
-            ]
-            cmd2 = [
-                ffmpeg_path, "-y",
-                "-i", str(clip),
-                "-ss", str(half), "-t", str(half),
-                "-c:v", "libx264", "-crf", "18", "-preset", "fast",
-                "-c:a", "aac", "-b:a", "192k",
-                str(part2)
-            ]
-
-            r1 = subprocess.run(cmd1, **get_subprocess_kwargs())
-            r2 = subprocess.run(cmd2, **get_subprocess_kwargs())
-            if r1.returncode == 0 and r2.returncode == 0:
-                log(f"  切割成功: {part1.name} + {part2.name}")
-                clip.unlink(missing_ok=True)
-                processed_clips.append(part1)
-                processed_clips.append(part2)
+            keyframes = get_keyframes(tmp_src)
+            if not is_dense(keyframes):
+                # 极端情况：转码后仍不密集，直接逐窗口重编码
+                force_reencode = True
             else:
-                log(f"  重编码切割失败，保留原片段 {clip.name}")
-                if part1.exists():
-                    part1.unlink(missing_ok=True)
-                if part2.exists():
-                    part2.unlink(missing_ok=True)
-                processed_clips.append(clip)
+                src_for_cut = tmp_src
+                log(f"✅ 密集关键帧中间文件已生成: {tmp_src.name}")
 
-    processed_clips = merge_short_clips(processed_clips, ffmpeg_path, ffprobe_path, output_dir)
+    clips = []
+    start = 0.0
+    idx = 0
+    while start < total - 0.05:
+        end = min(start + window, total)
+        out = output_dir / f"win_{idx:03d}.mp4"
+        if force_reencode:
+            cmd = [ffmpeg_path, "-y",
+                   "-ss", f"{start:.3f}", "-i", str(src_for_cut),
+                   "-t", f"{end - start:.3f}",
+                   "-c:v", "libx264", "-crf", "18", "-preset", "fast",
+                   "-c:a", "copy", str(out)]
+        else:
+            # 吸附起始点到 ≤ start 的最近关键帧，保证流复制切割落在关键帧
+            snap = start
+            if keyframes:
+                cand = [k for k in keyframes if k <= start + 1e-3]
+                snap = cand[-1] if cand else 0.0
+            cmd = [ffmpeg_path, "-y",
+                   "-ss", f"{snap:.3f}", "-i", str(src_for_cut),
+                   "-t", f"{end - snap:.3f}",
+                   "-c", "copy", "-avoid_negative_ts", "make_zero",
+                   str(out)]
+        r = subprocess.run(cmd, **get_subprocess_kwargs())
+        if r.returncode != 0:
+            if not force_reencode:
+                # 流复制偶发失败，回退该段重编码
+                log(f"⚠️ 流复制切割窗口 {idx} 失败，回退重编码")
+                cmd = [ffmpeg_path, "-y",
+                       "-ss", f"{start:.3f}", "-i", str(src_for_cut),
+                       "-t", f"{end - start:.3f}",
+                       "-c:v", "libx264", "-crf", "18", "-preset", "fast",
+                       "-c:a", "copy", str(out)]
+                r = subprocess.run(cmd, **get_subprocess_kwargs())
+            if r.returncode != 0:
+                log(f"❌ 切割窗口 {idx} 失败:\n{r.stderr}")
+                return None
+        clips.append(out)
+        if end >= total:
+            break
+        start += step
+        idx += 1
 
-    final_clips = sorted(processed_clips, key=lambda x: x.name)
-    log(f"🔧 最终待处理片段数: {len(final_clips)}")
-    return final_clips
+    mode = "逐窗口重编码" if force_reencode else "流复制"
+    log(f"✅ 重叠窗口切割完成，共 {len(clips)} 段 (窗口 {window}s / 重叠 {overlap}s / 模式: {mode})")
+    return clips
 
 # ================= 核心处理函数（失败跳过） =================
 def _move_to_failed(clip, safe_folder):
@@ -365,14 +385,14 @@ def process_single_video(video_path, config, in_progress_state=None):
             log(f"❌ 片段目录 {segment_dir} 不存在，重新切割")
             in_progress_state = None
         else:
-            clips = sorted(segment_dir.glob("seg_*.mp4"))
+            clips = sorted(segment_dir.glob("win_*.mp4"))
             log(f"🔄 从断点恢复，已切割片段 {len(clips)} 个")
     else:
         safe_name = video_path.stem
         segment_dir = SEGMENTS_BASE / safe_name
         if segment_dir.exists():
             clear_directory(segment_dir)
-        clips = split_video(video_path, SEGMENT_DURATION, ffmpeg_path, segment_dir)
+        clips = split_overlap_windows(video_path, SEGMENT_WINDOW, OVERLAP, ffmpeg_path, segment_dir)
         if not clips:
             return None, None
 
@@ -416,11 +436,11 @@ def process_single_video(video_path, config, in_progress_state=None):
 
     total = len(clips)
 
-    # ----- 内部函数：处理单个视频片段，返回生成的文件列表，失败返回 None -----
-    def _process_one_clip(clip_path, seg_index=None):
+    # ----- 内部函数：处理单个窗口视频，提取音频为 WAV，返回 WAV 路径，失败返回 None -----
+    def _process_one_clip(clip_path, win_idx=None):
         nonlocal prompt_template, load_id, combine_id, comfy_url, output_dir, temp_dir, ffmpeg_path, safe_folder
 
-        prefix = f"MMaudio_seg_{seg_index:03d}" if seg_index is not None else f"MMaudio_{uuid.uuid4().hex[:6]}"
+        prefix = f"MMaudio_win_{win_idx:03d}" if win_idx is not None else f"MMaudio_{uuid.uuid4().hex[:6]}"
         prompt_template[load_id]["inputs"]["video"] = str(clip_path)
         prompt_template[combine_id]["inputs"]["filename_prefix"] = prefix
 
@@ -430,7 +450,6 @@ def process_single_video(video_path, config, in_progress_state=None):
             return None
 
         wait_for_prompt(comfy_url, pid)
-        time.sleep(1)
 
         out_files = []
         for directory in (output_dir, temp_dir):
@@ -444,63 +463,53 @@ def process_single_video(video_path, config, in_progress_state=None):
             log(f"⚠️ 未找到输出文件: {prefix}_*-audio.mp4")
             return None
 
-        result = []
-        for f in out_files:
-            dest = safe_folder / f.name
-            try:
-                shutil.move(str(f), str(dest))
-            except Exception as e:
-                log(f"移动输出文件失败 {f.name}: {e}")
-                continue
+        src = out_files[0]
+        wav_path = safe_folder / f"{prefix}.wav"
+        cmd_wav = [
+            ffmpeg_path, "-y",
+            "-i", str(src),
+            "-vn", "-acodec", "pcm_s16le", "-ar", "44100",
+            str(wav_path)
+        ]
+        r_wav = subprocess.run(cmd_wav, **get_subprocess_kwargs())
+        if r_wav.returncode != 0:
+            log(f"⚠️ 音频提取失败: {r_wav.stderr}")
+            return None
 
-            synced_tmp = dest.with_suffix('.sync.mp4')
-            cmd_sync = [
-                ffmpeg_path, "-y",
-                "-i", str(clip_path),
-                "-i", str(dest),
-                "-c:v", "copy",
-                "-c:a", "aac", "-b:a", "192k",
-                "-map", "0:v",
-                "-map", "1:a",
-                "-shortest",
-                str(synced_tmp)
-            ]
-            r_sync = subprocess.run(cmd_sync, **get_subprocess_kwargs())
-            if r_sync.returncode == 0:
-                synced_tmp.replace(dest)
-                log(f"✅ 音频同步完成: {dest.name}")
-            else:
-                log(f"⚠️ 音频同步失败，保留原始输出: {r_sync.stderr}")
-                synced_tmp.unlink(missing_ok=True)
-            result.append(dest)
-        return result
+        try:
+            shutil.move(str(src), str(safe_folder / src.name))
+        except Exception as e:
+            log(f"归档原始输出失败 {src.name}: {e}")
 
-    # ----- 片段循环处理 -----
+        log(f"✅ 窗口音频提取完成: {wav_path.name}")
+        return wav_path
+
+    # ----- 重叠窗口循环处理 -----
+    win_idx = len(generated)
     idx = processed
-    while idx < total:
+    while idx < len(clips):
         if stop_flag.is_set():
             log("⏹️ 停止信号，保存进度")
             break
 
         clip = clips[idx]
-        log(f"▶️ 片段 {idx+1}/{total}: {clip.name}")
+        log(f"▶️ 窗口 {idx+1}/{len(clips)}: {clip.name} (音频序号 {win_idx})")
 
-        out_files = _process_one_clip(clip, seg_index=idx)
-        if out_files is not None:
-            generated.extend(out_files)
+        out = _process_one_clip(clip, win_idx=win_idx)
+        if out is not None:
+            generated.append(out)
             idx += 1
-            processed = idx
-            in_progress_state["processed"] = processed
+            win_idx += 1
+            in_progress_state["processed"] = idx
             in_progress_state["generated_files"] = [p.name for p in generated]
             save_progress(completed_videos, in_progress_all)
             continue
 
-        # --- 失败：尝试对半切割重试 ---
-        log(f"🔄 片段 {clip.name} 处理失败，尝试对半切割重试...")
+        # --- 失败：对半切割后放回列表，下一轮继续处理（保持时间顺序）---
         ffprobe_path = ffmpeg_path.replace("ffmpeg", "ffprobe")
         dur = get_duration(clip, ffprobe_path)
-        if dur is None or dur < 2.0:
-            log(f"❌ 片段时长过短或无法获取，放弃该视频")
+        if dur is None or dur < 3.0 or "_retry" in clip.name:
+            log(f"❌ 窗口 {clip.name} 处理失败且无法再分割，放弃该视频")
             _move_to_failed(clip, safe_folder)
             if clear_segments:
                 clear_directory(segment_dir)
@@ -508,31 +517,22 @@ def process_single_video(video_path, config, in_progress_state=None):
                 log("🗑️ 已删除持久化片段目录")
             return None, None
 
+        log(f"🔄 窗口 {clip.name} 处理失败，对半切割后重试...")
         half = dur / 2.0
         part1 = clip.parent / f"{clip.stem}_retry_a{clip.suffix}"
         part2 = clip.parent / f"{clip.stem}_retry_b{clip.suffix}"
 
-        cmd_split1 = [
-            ffmpeg_path, "-y",
-            "-i", str(clip),
-            "-ss", "0", "-t", str(half),
-            "-c:v", "libx264", "-crf", "18", "-preset", "fast",
-            "-c:a", "aac", "-b:a", "192k",
-            str(part1)
-        ]
-        cmd_split2 = [
-            ffmpeg_path, "-y",
-            "-i", str(clip),
-            "-ss", str(half), "-t", str(half),
-            "-c:v", "libx264", "-crf", "18", "-preset", "fast",
-            "-c:a", "aac", "-b:a", "192k",
-            str(part2)
-        ]
-        r1 = subprocess.run(cmd_split1, **get_subprocess_kwargs())
-        r2 = subprocess.run(cmd_split2, **get_subprocess_kwargs())
+        r1 = subprocess.run([
+            ffmpeg_path, "-y", "-i", str(clip), "-ss", "0", "-t", str(half),
+            "-c:v", "libx264", "-crf", "18", "-preset", "fast", "-c:a", "copy", str(part1)
+        ], **get_subprocess_kwargs())
+        r2 = subprocess.run([
+            ffmpeg_path, "-y", "-i", str(clip), "-ss", str(half), "-t", str(half),
+            "-c:v", "libx264", "-crf", "18", "-preset", "fast", "-c:a", "copy", str(part2)
+        ], **get_subprocess_kwargs())
         if r1.returncode != 0 or r2.returncode != 0:
-            log(f"❌ 切割重试失败，保留原片段，放弃该视频")
-            for p in [part1, part2]:
+            log(f"❌ 切割重试失败，放弃该视频")
+            for p in (part1, part2):
                 if p.exists():
                     p.unlink(missing_ok=True)
             _move_to_failed(clip, safe_folder)
@@ -542,54 +542,16 @@ def process_single_video(video_path, config, in_progress_state=None):
                 log("🗑️ 已删除持久化片段目录")
             return None, None
 
-        log(f"✂️ 已切割为 {part1.name} 和 {part2.name}，逐一处理")
-        out1 = _process_one_clip(part1, seg_index=idx)
-        if out1 is None:
-            log(f"❌ 子片段 {part1.name} 处理失败，放弃该视频")
-            for p in [part1, part2]:
-                if p.exists():
-                    p.unlink(missing_ok=True)
-            _move_to_failed(clip, safe_folder)
-            if clear_segments:
-                clear_directory(segment_dir)
-                segment_dir.rmdir()
-                log("🗑️ 已删除持久化片段目录")
-            return None, None
-
-        out2 = _process_one_clip(part2, seg_index=idx+1)
-        if out2 is None:
-            log(f"❌ 子片段 {part2.name} 处理失败，放弃该视频")
-            for f in out1:
-                if f.exists():
-                    f.unlink(missing_ok=True)
-            for p in [part1, part2]:
-                if p.exists():
-                    p.unlink(missing_ok=True)
-            _move_to_failed(clip, safe_folder)
-            if clear_segments:
-                clear_directory(segment_dir)
-                segment_dir.rmdir()
-                log("🗑️ 已删除持久化片段目录")
-            return None, None
-
-        log(f"✅ 切割重试成功，子片段输出已保存")
         clip.unlink(missing_ok=True)
-        part1.unlink(missing_ok=True)
-        part2.unlink(missing_ok=True)
-        generated.extend(out1)
-        generated.extend(out2)
-        idx += 1
-        processed = idx
-        in_progress_state["processed"] = processed
-        in_progress_state["generated_files"] = [p.name for p in generated]
-        save_progress(completed_videos, in_progress_all)
+        clips[idx:idx+1] = [part1, part2]
+        log(f"✂️ 已替换为 {part1.name} 与 {part2.name}，继续处理")
 
-    if stop_flag.is_set() or processed < total:
-        log(f"⏸️ 暂停在片段 {processed}/{total}，进度已保存")
+    if stop_flag.is_set() or idx < len(clips):
+        log(f"⏸️ 暂停在窗口 {idx}/{len(clips)}，进度已保存")
         return None, in_progress_state
 
-    # ---------- 合成阶段 ----------
-    log(f"🔗 合成 {len(generated)} 个片段...")
+    # ---------- 合成阶段（重叠窗口 + 音频交叉淡化，无缝过渡） ----------
+    log(f"🔗 交叉淡化合成 {len(generated)} 个窗口音频...")
     if not generated:
         log("❌ 无输出片段可合成")
         if clear_segments:
@@ -599,31 +561,13 @@ def process_single_video(video_path, config, in_progress_state=None):
         return None, None
 
     def extract_num(fpath):
-        m = re.search(r'_(\d+)_', Path(fpath).stem)
+        m = re.search(r'(\d+)', Path(fpath).stem)
         return int(m.group(1)) if m else 0
 
     generated.sort(key=extract_num)
 
-    # ---- 使用 concat filter 替代 concat demuxer，消除编码不一致问题 ----
-    inputs = []
-    filter_parts = []
-    for i, gf in enumerate(generated):
-        inputs.extend(['-i', str(gf)])
-        filter_parts.append(f'[{i}:v:0][{i}:a:0]')
-
-    concat_filter = ''.join(filter_parts) + f'concat=n={len(generated)}:v=1:a=1[outv][outa]'
-
     final = FINISH_DIR / f"{video_path.stem}.mp4"
-    cmd = [
-        ffmpeg_path, '-y',
-        *inputs,
-        '-filter_complex', concat_filter,
-        '-map', '[outv]', '-map', '[outa]',
-        '-c:v', 'libx264', '-crf', '18', '-preset', 'medium',
-        '-c:a', 'aac', '-b:a', '192k',
-        str(final)
-    ]
-    r = subprocess.run(cmd, **get_subprocess_kwargs())
+    ok = assemble_crossfade(video_path, generated, ffmpeg_path, final, OVERLAP)
 
     # 根据配置清理输出/临时目录
     if clear_output:
@@ -636,70 +580,54 @@ def process_single_video(video_path, config, in_progress_state=None):
         segment_dir.rmdir()
         log("🗑️ 已删除持久化片段目录")
 
-    if r.returncode != 0:
-        log(f"合并失败:\n{r.stderr}")
+    if not ok:
+        log("❌ 合成失败")
         return None, None
 
     log(f"🎉 合成成功: {final.name}")
     return final, None
 
-# ================= 手动合成功能（同样改用 concat filter） =================
+# ================= 手动合成功能（交叉淡化版） =================
 def manual_merge(video_name, ffmpeg_path):
     safe_folder = FINISH_DIR / video_name
     if not safe_folder.exists() or not safe_folder.is_dir():
         log(f"❌ 目录 {safe_folder} 不存在")
         return False
 
-    clips = list(safe_folder.glob("*.*-audio.mp4"))
+    clips = list(safe_folder.glob("MMaudio_win_*.wav"))
     if not clips:
-        log(f"❌ 目录 {safe_folder} 中没有找到带 -audio 的片段")
+        log(f"❌ 目录 {safe_folder} 中没有找到窗口音频 MMaudio_win_*.wav")
         return False
 
     def extract_num(fpath):
-        m = re.search(r'_(\d+)_', fpath.stem)
+        m = re.search(r'(\d+)', Path(fpath).stem)
         return int(m.group(1)) if m else 0
 
     clips.sort(key=extract_num)
 
-    inputs = []
-    filter_parts = []
-    for i, cl in enumerate(clips):
-        inputs.extend(['-i', str(cl)])
-        filter_parts.append(f'[{i}:v:0][{i}:a:0]')
-
-    concat_filter = ''.join(filter_parts) + f'concat=n={len(clips)}:v=1:a=1[outv][outa]'
+    original_video = SCRIPT_DIR / f"{video_name}.mp4"
+    if not original_video.exists():
+        log(f"❌ 找不到原视频 {original_video}，无法合成")
+        return False
 
     output_path = FINISH_DIR / f"{video_name}.mp4"
-    cmd = [
-        ffmpeg_path, '-y',
-        *inputs,
-        '-filter_complex', concat_filter,
-        '-map', '[outv]', '-map', '[outa]',
-        '-c:v', 'libx264', '-crf', '18', '-preset', 'medium',
-        '-c:a', 'aac', '-b:a', '192k',
-        str(output_path)
-    ]
-    r = subprocess.run(cmd, **get_subprocess_kwargs())
-
-    if r.returncode == 0:
+    if assemble_crossfade(original_video, clips, ffmpeg_path, output_path, OVERLAP):
         log(f"🎉 手动合成成功: {output_path.name}")
-        original_video = SCRIPT_DIR / f"{video_name}.mp4"
-        if original_video.exists():
-            try:
-                shutil.move(str(original_video), str(DUCE_DIR / original_video.name))
-                log(f"📁 原视频已移至 Duce")
-            except Exception as e:
-                log(f"移动原视频失败: {e}")
+        try:
+            shutil.move(str(original_video), str(DUCE_DIR / original_video.name))
+            log(f"📁 原视频已移至 Duce")
+        except Exception as e:
+            log(f"移动原视频失败: {e}")
         return True
     else:
-        log(f"手动合成失败:\n{r.stderr}")
+        log(f"手动合成失败")
         return False
 
 # ================= GUI 应用 =================
 class VideoProcessorApp(Tk):
     def __init__(self):
         super().__init__()
-        self.title("MMAudio 批量处理 v3.9.2（合成修复版）")
+        self.title("MMAudio 批量处理 v4.0（重叠窗口·交叉淡化无缝版）")
         self.geometry("1000x800")
         self.resizable(True, True)
         self.configure(bg='#f0f0f0')

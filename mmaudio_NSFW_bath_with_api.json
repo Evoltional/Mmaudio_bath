@@ -15,11 +15,11 @@
         "105",
         7
       ],
-      "steps": 150,
-      "cfg": 9,
-      "seed": 184852840990216,
+      "steps": 25,
+      "cfg": 4.5,
+      "seed": 184852840990218,
       "prompt": "youthful anime girl voice",
-      "negative_prompt": "talking, speech, dialogue, music, singing, male voice, background noise, dry sounds, quiet, calm, close-mic'd, intimate, whisper, ear-level, ASMR, muffled, boomy, low-pass, boxy, excessive bass, chest-only, dry sound, room reverb, hollow, telephone quality,",
+      "negative_prompt": "talking, speech, dialogue, music, singing, male voice, background noise, dry sounds, calm, whisper, ear-level, ASMR, room reverb, hollow, telephone quality,",
       "mask_away_clip": false,
       "force_offload": true,
       "mmaudio_model": [
