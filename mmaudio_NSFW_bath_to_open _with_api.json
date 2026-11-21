@@ -6,7 +6,9 @@
     },
     "class_type": "MMAudioModelLoader",
     "_meta": {
-      "title": "MMAudio ModelLoader"
+      "title": "MMAudio ModelLoader",
+      "cnr_id": "comfyui-mmaudio",
+      "ver": "1.0.3"
     }
   },
   "92": {
@@ -17,9 +19,9 @@
       ],
       "steps": 25,
       "cfg": 4.5,
-      "seed": 184852840990218,
-      "prompt": "youthful anime girl voice",
-      "negative_prompt": "talking, speech, dialogue, music, singing, male voice, background noise, dry sounds, calm, whisper, ear-level, ASMR, room reverb, hollow, telephone quality,",
+      "seed": 184852840990222,
+      "prompt": "anime girl voice",
+      "negative_prompt": "talking, speech, dialogue, music, singing, male voice, background noise, dry sounds, calm, whisper, ",
       "mask_away_clip": false,
       "force_offload": true,
       "mmaudio_model": [
@@ -37,7 +39,9 @@
     },
     "class_type": "MMAudioSampler",
     "_meta": {
-      "title": "MMAudio Sampler"
+      "title": "MMAudio Sampler",
+      "cnr_id": "comfyui-mmaudio",
+      "ver": "1.0.3"
     }
   },
   "97": {
@@ -66,7 +70,9 @@
     },
     "class_type": "VHS_VideoCombine",
     "_meta": {
-      "title": "Video Combine 🎥🅥🅗🅢"
+      "title": "Video Combine 🎥🅥🅗🅢",
+      "cnr_id": "comfyui-videohelpersuite",
+      "ver": "1.7.7"
     }
   },
   "98": {
@@ -78,7 +84,9 @@
     },
     "class_type": "PreviewAudio",
     "_meta": {
-      "title": "预览音频"
+      "title": "预览音频",
+      "cnr_id": "comfy-core",
+      "ver": "0.3.64"
     }
   },
   "102": {
@@ -91,7 +99,9 @@
     },
     "class_type": "MMAudioFeatureUtilsLoader",
     "_meta": {
-      "title": "MMAudio FeatureUtilsLoader"
+      "title": "MMAudio FeatureUtilsLoader",
+      "cnr_id": "comfyui-mmaudio",
+      "ver": "1.0.3"
     }
   },
   "105": {
@@ -103,7 +113,9 @@
     },
     "class_type": "VHS_VideoInfo",
     "_meta": {
-      "title": "Video Info 🎥🅥🅗🅢"
+      "title": "Video Info 🎥🅥🅗🅢",
+      "cnr_id": "comfyui-videohelpersuite",
+      "ver": "1.7.7"
     }
   },
   "110": {
@@ -119,7 +131,9 @@
     },
     "class_type": "VHS_LoadVideoPath",
     "_meta": {
-      "title": "Load Video (Path) 🎥🅥🅗🅢"
+      "title": "Load Video (Path) 🎥🅥🅗🅢",
+      "cnr_id": "comfyui-videohelpersuite",
+      "ver": "4ee72c065db22c9d96c2427954dc69e7b908444b"
     }
   }
 }
