@@ -10,6 +10,7 @@ MMAudio 长视频自动配音工具
   3. 批量提交给本地 ComfyUI，轮询结果并下载生成的音频
   4. 把生成的音频与原视频片段合并
   5. 全部完成后把片段拼接回完整视频（可选音频交叉淡化，避免拼接处突兀）
+  6. 自动扫描程序目录下的所有 mp4，逐个排队处理，并保留日志到程序目录
 
 依赖：仅 Python 标准库 + 系统 PATH 中的 ffmpeg / ffprobe
 运行：python mmaudio_long_video.py
@@ -35,8 +36,12 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 APP_TITLE = "MMAudio 长视频自动配音工具"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 CONFIG_NAME = "mmaudio_long_video_config.json"
+LOG_NAME = "mmaudio_long_video.log"
+APP_DIR = Path(__file__).resolve().parent
+LOG_PATH = APP_DIR / LOG_NAME
+OUTPUT_SUFFIX = "_mmaudio.mp4"
 
 
 class ToolError(Exception):
@@ -60,6 +65,55 @@ def resolve_output_path(cfg):
     if not out_dir:
         out_dir = str(src.parent)
     return Path(out_dir) / path
+
+
+def scan_mp4_files(folder):
+    """扫描程序目录下的待处理 mp4，排除本程序生成的成品。"""
+    files = []
+    for p in Path(folder).glob("*.mp4"):
+        if p.name.lower().endswith(OUTPUT_SUFFIX.lower()):
+            continue
+        if not p.is_file():
+            continue
+        files.append(p)
+    return sorted(files, key=lambda p: p.name.lower())
+
+
+def cleanup_comfy_output(mode, own_outputs, comfy_out, app_dir, log):
+    """清理 ComfyUI 输出目录。采用移动到程序目录回收站的方式，可恢复。"""
+    if mode not in ("own", "all") or not Path(comfy_out).is_dir():
+        return 0
+    comfy_out = Path(comfy_out)
+    trash = Path(app_dir) / ("_comfy_output_trash_" + time.strftime("%Y%m%d_%H%M%S"))
+    if mode == "own":
+        targets = [comfy_out / str(item.get("subfolder", "")) / item.get("filename", "")
+                   for item in own_outputs if item.get("filename")]
+    else:
+        targets = [p for p in comfy_out.rglob("*") if p.is_file()]
+    moved = 0
+    for src in targets:
+        if not src.is_file():
+            continue
+        try:
+            rel = src.relative_to(comfy_out)
+        except ValueError:
+            continue
+        dst = trash / rel
+        try:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(src), str(dst))
+            moved += 1
+        except OSError as exc:
+            log("移动文件失败 %s：%s" % (src, exc), "warn")
+    if mode == "all":
+        for d in sorted((x for x in comfy_out.rglob("*") if x.is_dir()),
+                        key=lambda x: len(x.parts), reverse=True):
+            try:
+                d.rmdir()
+            except OSError:
+                pass
+    log("已清理 ComfyUI 输出：%d 个文件移至 %s" % (moved, trash), "ok")
+    return moved
 
 
 class InterruptedError_(Exception):
@@ -410,6 +464,7 @@ class Pipeline:
         self.progress = callbacks["progress"]
         self.stop_event = callbacks["stop"]
         self.done = callbacks["done"]
+        self.generated_outputs = []
 
     def _check_stop(self):
         if self.stop_event.is_set():
@@ -597,6 +652,8 @@ class Pipeline:
                 if not node_out or not node_out.get("audio"):
                     raise ToolError("ComfyUI 输出中没有音频，检查 SaveAudio 节点是否执行。")
                 client.download_view(node_out["audio"][0], out_path)
+                if node_out["audio"][0] not in self.generated_outputs:
+                    self.generated_outputs.append(dict(node_out["audio"][0]))
                 if out_path.stat().st_size < 1024:
                     raise ToolError("下载的音频文件为空。")
                 self.log("  第 %d 段音频生成完成：%s" % (idx + 1, out_path.name), "ok")
@@ -740,9 +797,9 @@ ERR = "#f48771"
 
 DEFAULT_CONFIG = {
     "input_video": "",
-    "output_dir": "",
+    "output_dir": str(APP_DIR),
     "output_video": "",
-    "workflow_json": r"E:\Temp\Huawei Share\mmaudio_NSFW_bath_to_open _with_api.json",
+    "workflow_json": str(APP_DIR / "mmaudio_NSFW_bath_to_open _with_api.json"),
     "comfy_url": "http://127.0.0.1:8188",
     "prompt": "anime girl voice",
     "negative_prompt": "talking, speech, dialogue, music, singing, male voice, background noise, dry sounds, calm, whisper, ",
@@ -760,29 +817,38 @@ DEFAULT_CONFIG = {
     "original_volume": 0.3,
     "crossfade": 0.15,
     "retries": 2,
-    "keep_temp": False,
+    "keep_temp": True,
     "poll_interval": 0.8,
     "max_wait": 3600,
     "request_timeout": 30,
+    "comfy_output_dir": r"E:\Ordrnary\ComfyUI-aki-v3\ComfyUI\output",
+    "clean_output": "none",
+    "temp_policy_migrated": False,
 }
+
 
 
 class App:
     def __init__(self, root):
         self.root = root
         self.root.title("%s  v%s" % (APP_TITLE, APP_VERSION))
-        self.root.geometry("1020x820")
-        self.root.minsize(900, 700)
+        self.root.geometry("1560x920")
+        self.root.minsize(1180, 760)
         self.root.configure(bg=BG)
-        self.cfg_path = Path(__file__).resolve().parent / CONFIG_NAME
+        self.cfg_path = APP_DIR / CONFIG_NAME
         self.cfg = self.load_config()
         self.ui_queue = queue.Queue()
         self.stop_event = threading.Event()
         self.worker = None
-
+        self.pending_files = {}
+        self.completed_files = {}
+        self.duration_cache = {}
         self._build_style()
         self._build_ui()
         self._load_fields()
+        self.refresh_video_list()
+        self.log("程序启动：%s" % APP_DIR, "info")
+        self.log("日志同时写入：%s" % LOG_PATH, "info")
         self.root.after(120, self._drain_queue)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -794,12 +860,16 @@ class App:
                 cfg.update(json.loads(self.cfg_path.read_text(encoding="utf-8")))
             except (json.JSONDecodeError, OSError):
                 pass
-        # 兼容旧配置：把“输出视频”里填的目录迁移到“输出目录”
-        raw_out = str(cfg.get("output_video", "") or "").strip()
-        if raw_out and Path(raw_out).is_absolute() and Path(raw_out).is_dir():
-            cfg["output_dir"] = raw_out
-            src = str(cfg.get("input_video", "") or "").strip()
-            cfg["output_video"] = (Path(src).stem + "_mmaudio.mp4") if src else "output.mp4"
+        # 所有产物和临时文件都固定在程序目录
+        cfg["output_dir"] = str(APP_DIR)
+        # 工作流找不到时回退到程序目录里的副本
+        wf = Path(str(cfg.get("workflow_json", "") or ""))
+        if not wf.is_file():
+            cfg["workflow_json"] = str(APP_DIR / "mmaudio_NSFW_bath_to_open _with_api.json")
+        # 一次性迁移：新版本默认保留中间文件
+        if not cfg.get("temp_policy_migrated"):
+            cfg["keep_temp"] = True
+            cfg["temp_policy_migrated"] = True
         return cfg
 
     def save_config(self):
@@ -815,7 +885,8 @@ class App:
         style.theme_use("clam")
         style.configure("TFrame", background=BG)
         style.configure("Card.TLabelframe", background=PANEL, foreground=FG, bordercolor="#3e3e42")
-        style.configure("Card.TLabelframe.Label", background=PANEL, foreground="#569cd6", font=("Microsoft YaHei UI", 10, "bold"))
+        style.configure("Card.TLabelframe.Label", background=PANEL, foreground="#569cd6",
+                        font=("Microsoft YaHei UI", 10, "bold"))
         style.configure("TLabel", background=PANEL, foreground=FG, font=("Microsoft YaHei UI", 10))
         style.configure("Muted.TLabel", background=PANEL, foreground=MUTED, font=("Microsoft YaHei UI", 9))
         style.configure("TEntry", fieldbackground=PANEL2, foreground=FG, insertcolor=FG, bordercolor="#3e3e42")
@@ -832,75 +903,113 @@ class App:
         style.configure("TProgressbar", background=ACCENT, troughcolor=PANEL2, bordercolor=PANEL2)
         style.configure("TCombobox", fieldbackground=PANEL2, foreground=FG, background=PANEL2,
                         arrowcolor=FG, bordercolor="#3e3e42")
+        style.configure("Treeview", background=PANEL2, fieldbackground=PANEL2, foreground=FG,
+                        bordercolor="#3e3e42", rowheight=24, font=("Microsoft YaHei UI", 9))
+        style.configure("Treeview.Heading", background=PANEL, foreground="#569cd6",
+                        font=("Microsoft YaHei UI", 9, "bold"))
+        style.map("Treeview", background=[("selected", ACCENT)])
 
     # ---- UI ----
     def _build_ui(self):
-        canvas = tk.Canvas(self.root, bg=BG, highlightthickness=0)
-        scrollbar = ttk.Scrollbar(self.root, orient="vertical", command=canvas.yview)
-        self.main = ttk.Frame(canvas)
-        self.main.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.create_window((0, 0), window=self.main, anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
-        canvas.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
-        canvas.bind_all("<MouseWheel>", lambda e: canvas.yview_scroll(int(-1 * (e.delta / 120)), "units"))
+        main = ttk.Frame(self.root)
+        main.pack(fill="both", expand=True)
+        hpane = ttk.PanedWindow(main, orient="horizontal")
+        hpane.pack(fill="both", expand=True)
 
-        head = ttk.Frame(self.main)
-        head.pack(fill="x", padx=16, pady=(14, 8))
+        # 左侧：上部设置 + 下部两个列表
+        left = ttk.Frame(hpane)
+        hpane.add(left, weight=3)
+        head = ttk.Frame(left)
+        head.pack(fill="x", padx=12, pady=(10, 4))
         tk.Label(head, text=APP_TITLE, bg=BG, fg="#569cd6",
-                 font=("Microsoft YaHei UI", 17, "bold")).pack(side="left")
-        tk.Label(head, text="ffmpeg 分段 → ComfyUI MMAudio → 音频回灌 → 拼接",
-                 bg=BG, fg=MUTED, font=("Microsoft YaHei UI", 9)).pack(side="left", padx=14, pady=(8, 0))
+                 font=("Microsoft YaHei UI", 16, "bold")).pack(side="left")
+        tk.Label(head, text="自动扫描程序目录 · 批量处理 · 日志留档",
+                 bg=BG, fg=MUTED, font=("Microsoft YaHei UI", 9)).pack(side="left", padx=12, pady=(6, 0))
 
-        # 路径
-        card = ttk.LabelFrame(self.main, text=" 路径与连接 ", style="Card.TLabelframe")
-        card.pack(fill="x", padx=16, pady=6)
+        vpane = ttk.PanedWindow(left, orient="vertical")
+        vpane.pack(fill="both", expand=True, padx=8, pady=(2, 8))
+        top = ttk.Frame(vpane)
+        bottom = ttk.Frame(vpane)
+        vpane.add(top, weight=3)
+        vpane.add(bottom, weight=2)
+
+        # 操作条固定在设置区底部
+        action = ttk.Frame(top)
+        action.pack(side="bottom", fill="x", padx=6, pady=(2, 6))
+        self.btn_start = ttk.Button(action, text="开始处理全部", style="Primary.TButton",
+                                    command=self._start, width=17)
+        self.btn_start.pack(side="left")
+        self.btn_stop = ttk.Button(action, text="停止", style="Stop.TButton",
+                                   command=self._stop, width=9, state="disabled")
+        self.btn_stop.pack(side="left", padx=6)
+        ttk.Button(action, text="刷新列表", command=self.refresh_video_list, width=11).pack(side="left")
+        ttk.Button(action, text="打开程序目录", command=self._open_folder, width=14).pack(side="left", padx=6)
+        self.status = ttk.Label(action, text="就绪", foreground=MUTED, width=42, anchor="w")
+        self.status.pack(side="left", padx=6)
+        self.progress = ttk.Progressbar(action, mode="determinate", length=160)
+        self.progress.pack(side="left", fill="x", expand=True)
+
+        canvas = tk.Canvas(top, bg=BG, highlightthickness=0)
+        sb = ttk.Scrollbar(top, orient="vertical", command=canvas.yview)
+        self.settings = ttk.Frame(canvas)
+        win = canvas.create_window((0, 0), window=self.settings, anchor="nw")
+        self.settings.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(win, width=e.width))
+        canvas.configure(yscrollcommand=sb.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        canvas.bind("<MouseWheel>", lambda e: canvas.yview_scroll(int(-1 * (e.delta / 120)), "units"))
+
         self.vars = {}
-        row = 0
-        for key, label, browse in (
-            ("input_video", "输入长视频", "file"),
-            ("output_dir", "输出目录", "dir"),
-            ("output_video", "输出文件名", "save"),
-            ("workflow_json", "API 工作流 JSON", "json"),
-        ):
-            ttk.Label(card, text=label).grid(row=row, column=0, sticky="w", padx=12, pady=5)
-            var = tk.StringVar()
-            ttk.Entry(card, textvariable=var, width=88).grid(row=row, column=1, sticky="ew", pady=5)
-            ttk.Button(card, text="浏览…", command=lambda k=key, t=browse: self._browse(k, t), width=9).grid(
-                row=row, column=2, padx=(6, 12), pady=5)
-            self.vars[key] = var
-            row += 1
+        # 路径与连接
+        card = ttk.LabelFrame(self.settings, text=" 路径与连接 ", style="Card.TLabelframe")
+        card.pack(fill="x", padx=8, pady=(8, 6))
+        self.vars["workflow_json"] = tk.StringVar()
+        ttk.Label(card, text="API 工作流 JSON").grid(row=0, column=0, sticky="w", padx=10, pady=5)
+        ttk.Entry(card, textvariable=self.vars["workflow_json"], width=78).grid(row=0, column=1, sticky="ew", pady=5)
+        ttk.Button(card, text="浏览…", command=lambda: self._browse("workflow_json", "json"), width=9).grid(
+            row=0, column=2, padx=(6, 10), pady=5)
+        self.vars["comfy_url"] = tk.StringVar()
+        ttk.Label(card, text="ComfyUI 地址").grid(row=1, column=0, sticky="w", padx=10, pady=5)
+        ttk.Entry(card, textvariable=self.vars["comfy_url"], width=40).grid(row=1, column=1, sticky="w", pady=5)
+        ttk.Button(card, text="预检连接", command=self._precheck, width=9).grid(
+            row=1, column=2, padx=(6, 10), pady=5)
+        self.vars["comfy_output_dir"] = tk.StringVar()
+        ttk.Label(card, text="ComfyUI output").grid(row=2, column=0, sticky="w", padx=10, pady=5)
+        ttk.Entry(card, textvariable=self.vars["comfy_output_dir"], width=78).grid(row=2, column=1, sticky="ew", pady=5)
+        ttk.Button(card, text="浏览…", command=lambda: self._browse("comfy_output_dir", "dir"), width=9).grid(
+            row=2, column=2, padx=(6, 10), pady=5)
+        self.vars["clean_output"] = tk.StringVar()
+        ttk.Label(card, text="每个视频完成后清理").grid(row=3, column=0, sticky="w", padx=10, pady=5)
+        ttk.Combobox(card, textvariable=self.vars["clean_output"], state="readonly", width=32,
+                     values=["none", "own", "all"]).grid(row=3, column=1, sticky="w", pady=5)
+        tk.Label(card, text="none=不清理 / own=仅移走本程序生成 / all=移走 output 内全部文件（会二次确认）",
+                 bg=PANEL, fg=MUTED, font=("Microsoft YaHei UI", 9)).grid(
+            row=4, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 6))
         card.columnconfigure(1, weight=1)
 
-        ttk.Label(card, text="ComfyUI 地址").grid(row=row, column=0, sticky="w", padx=12, pady=5)
-        self.vars["comfy_url"] = tk.StringVar()
-        ttk.Entry(card, textvariable=self.vars["comfy_url"], width=40).grid(row=row, column=1, sticky="w", pady=5)
-        ttk.Button(card, text="预检连接", command=self._precheck, width=9).grid(row=row, column=2, padx=(6, 12), pady=5)
-
         # 生成参数
-        card2 = ttk.LabelFrame(self.main, text=" MMAudio 生成参数 ", style="Card.TLabelframe")
-        card2.pack(fill="x", padx=16, pady=6)
-        ttk.Label(card2, text="提示词 Prompt").grid(row=0, column=0, sticky="nw", padx=12, pady=5)
+        card2 = ttk.LabelFrame(self.settings, text=" MMAudio 生成参数 ", style="Card.TLabelframe")
+        card2.pack(fill="x", padx=8, pady=6)
+        ttk.Label(card2, text="提示词 Prompt").grid(row=0, column=0, sticky="nw", padx=10, pady=5)
         self.txt_prompt = tk.Text(card2, height=3, bg=PANEL2, fg=FG, insertbackground=FG,
                                   relief="flat", font=("Microsoft YaHei UI", 10), wrap="word")
-        self.txt_prompt.grid(row=0, column=1, columnspan=3, sticky="ew", pady=5, ipadx=4)
-        ttk.Label(card2, text="负向提示词").grid(row=1, column=0, sticky="nw", padx=12, pady=5)
+        self.txt_prompt.grid(row=0, column=1, columnspan=3, sticky="ew", pady=5)
+        ttk.Label(card2, text="负向提示词").grid(row=1, column=0, sticky="nw", padx=10, pady=5)
         self.txt_neg = tk.Text(card2, height=3, bg=PANEL2, fg=FG, insertbackground=FG,
                                relief="flat", font=("Microsoft YaHei UI", 10), wrap="word")
-        self.txt_neg.grid(row=1, column=1, columnspan=3, sticky="ew", pady=5, ipadx=4)
-
-        num_row = 2
+        self.txt_neg.grid(row=1, column=1, columnspan=3, sticky="ew", pady=5)
         self.vars["steps"] = tk.StringVar()
         self.vars["cfg"] = tk.StringVar()
         self.vars["seed"] = tk.StringVar()
         for col, (key, label, width) in enumerate((
             ("steps", "Steps", 10), ("cfg", "CFG", 10), ("seed", "Seed", 24),
         )):
-            ttk.Label(card2, text=label).grid(row=num_row, column=col * 2, sticky="w", padx=(12, 4), pady=6)
+            ttk.Label(card2, text=label).grid(row=2, column=col * 2, sticky="w", padx=(10, 4), pady=6)
             ttk.Entry(card2, textvariable=self.vars[key], width=width).grid(
-                row=num_row, column=col * 2 + 1, sticky="w", pady=6)
-        ttk.Label(card2, text="种子模式").grid(row=3, column=0, sticky="w", padx=12, pady=6)
+                row=2, column=col * 2 + 1, sticky="w", pady=6)
         self.vars["seed_mode"] = tk.StringVar()
+        ttk.Label(card2, text="种子模式").grid(row=3, column=0, sticky="w", padx=10, pady=6)
         ttk.Combobox(card2, textvariable=self.vars["seed_mode"], state="readonly", width=22,
                      values=["fixed", "increment", "random"]).grid(row=3, column=1, sticky="w", pady=6)
         self.vars["force_offload"] = tk.BooleanVar()
@@ -912,15 +1021,11 @@ class App:
         card2.columnconfigure(1, weight=1)
 
         # 分段与合成
-        card3 = ttk.LabelFrame(self.main, text=" 分段与合成 ", style="Card.TLabelframe")
-        card3.pack(fill="x", padx=16, pady=6)
-        self.vars["max_duration"] = tk.StringVar()
-        self.vars["condition_fps"] = tk.StringVar()
-        self.vars["condition_width"] = tk.StringVar()
-        self.vars["condition_height"] = tk.StringVar()
-        self.vars["original_volume"] = tk.StringVar()
-        self.vars["crossfade"] = tk.StringVar()
-        self.vars["retries"] = tk.StringVar()
+        card3 = ttk.LabelFrame(self.settings, text=" 分段与合成 ", style="Card.TLabelframe")
+        card3.pack(fill="x", padx=8, pady=(6, 10))
+        for key in ("max_duration", "condition_fps", "condition_width", "condition_height",
+                    "original_volume", "crossfade", "retries"):
+            self.vars[key] = tk.StringVar()
         fields = (
             ("max_duration", "最大分段时长(s)", 12),
             ("condition_fps", "条件帧率(≥25)", 12),
@@ -932,48 +1037,96 @@ class App:
         )
         for i, (key, label, width) in enumerate(fields):
             col, r = (i % 3) * 2, (i // 3) * 2
-            ttk.Label(card3, text=label).grid(row=r, column=col, sticky="w", padx=(12, 4), pady=5)
+            ttk.Label(card3, text=label).grid(row=r, column=col, sticky="w", padx=(10, 4), pady=5)
             ttk.Entry(card3, textvariable=self.vars[key], width=width).grid(
                 row=r, column=col + 1, sticky="w", pady=5)
-        ttk.Label(card3, text="音频模式").grid(row=3, column=0, sticky="w", padx=12, pady=5)
         self.vars["audio_mode"] = tk.StringVar()
+        self.vars["keep_temp"] = tk.BooleanVar()
+        ttk.Label(card3, text="音频模式").grid(row=3, column=0, sticky="w", padx=10, pady=5)
         ttk.Combobox(card3, textvariable=self.vars["audio_mode"], state="readonly", width=22,
                      values=["replace", "mix"]).grid(row=3, column=1, sticky="w", pady=5)
-        self.vars["keep_temp"] = tk.BooleanVar()
-        ttk.Checkbutton(card3, text="保留中间文件（调试用）",
+        ttk.Checkbutton(card3, text="保留中间文件（程序目录内）",
                         variable=self.vars["keep_temp"]).grid(row=3, column=2, sticky="w", pady=5)
-        tk.Label(card3, text="条件帧率 25 保证 MMAudio 按帧数回算的时长与片段一致；\n"
-                             "宽高建议 384×216（16:9，约 200MB/段）。填 0×0 则送原始分辨率，8 秒 1080p 会占约 4.6GB 并导致严重降速。",
+        tk.Label(card3, text="宽高建议 384×216（8 秒 1080p 送原分辨率会占约 4.6GB 并严重降速）。\n"
+                             "输出文件与各视频的 _mmaudio_work_ 临时目录均在本程序文件夹。",
                  bg=PANEL, fg=MUTED, font=("Microsoft YaHei UI", 9), justify="left").grid(
-            row=4, column=0, columnspan=6, sticky="w", padx=12, pady=(2, 8))
+            row=4, column=0, columnspan=6, sticky="w", padx=10, pady=(2, 8))
 
-        # 操作
-        action = ttk.Frame(self.main)
-        action.pack(fill="x", padx=16, pady=10)
-        self.btn_start = ttk.Button(action, text="开始处理", style="Primary.TButton",
-                                    command=self._start, width=16)
-        self.btn_start.pack(side="left")
-        self.btn_stop = ttk.Button(action, text="停止", style="Stop.TButton",
-                                   command=self._stop, width=10, state="disabled")
-        self.btn_stop.pack(side="left", padx=8)
-        ttk.Button(action, text="打开输出目录", command=self._open_output, width=14).pack(side="left")
-        self.status = ttk.Label(action, text="就绪", foreground=MUTED)
-        self.status.pack(side="left", padx=14)
-        self.progress = ttk.Progressbar(self.main, mode="determinate", length=100)
-        self.progress.pack(fill="x", padx=16, pady=(0, 6))
+        # 下部：待处理 / 已完成
+        lists = ttk.Frame(bottom)
+        lists.pack(fill="both", expand=True, padx=6, pady=(4, 4))
+        pending_lf = ttk.LabelFrame(lists, text=" 待处理视频 ", style="Card.TLabelframe")
+        pending_lf.pack(side="left", fill="both", expand=True, padx=(4, 4))
+        done_lf = ttk.LabelFrame(lists, text=" 已完成视频 ", style="Card.TLabelframe")
+        done_lf.pack(side="right", fill="both", expand=True, padx=(4, 4))
+        self.pending_tree = self._make_tree(pending_lf)
+        self.completed_tree = self._make_tree(done_lf)
+        self.completed_tree.tag_configure("ok", foreground=OK)
+        self.completed_tree.tag_configure("err", foreground=ERR)
 
-        log_card = ttk.LabelFrame(self.main, text=" 运行日志 ", style="Card.TLabelframe")
-        log_card.pack(fill="both", expand=True, padx=16, pady=(6, 16))
-        self.log_text = tk.Text(log_card, height=14, bg="#1a1a1a", fg=FG, insertbackground=FG,
-                                relief="flat", font=("Consolas", 9))
+        # 右侧日志
+        log_box = ttk.LabelFrame(hpane, text=" 运行日志（同时写入 mmaudio_long_video.log） ",
+                                 style="Card.TLabelframe")
+        hpane.add(log_box, weight=2)
+        self.log_text = tk.Text(log_box, bg="#1a1a1a", fg=FG, insertbackground=FG,
+                                relief="flat", font=("Consolas", 9), wrap="none")
         self.log_text.pack(side="left", fill="both", expand=True, padx=(6, 0), pady=6)
         for level, color in (("info", FG), ("cmd", MUTED), ("ok", OK), ("warn", WARN), ("error", ERR)):
             self.log_text.tag_configure(level, foreground=color)
-        log_scroll = ttk.Scrollbar(log_card, command=self.log_text.yview)
+        log_scroll = ttk.Scrollbar(log_box, command=self.log_text.yview)
         log_scroll.pack(side="right", fill="y", pady=6)
         self.log_text.configure(yscrollcommand=log_scroll.set)
-        self.log("就绪。请填写输入视频、输出路径，确认 ComfyUI 已启动后点击“开始处理”。", "info")
+        ttk.Button(log_box, text="打开日志", command=self._open_log, width=11).place(
+            relx=1.0, rely=0.0, x=-100, y=4)
 
+    def _make_tree(self, parent):
+        frame = ttk.Frame(parent)
+        frame.pack(fill="both", expand=True, padx=6, pady=6)
+        tree = ttk.Treeview(frame, columns=("name", "size", "duration"), show="headings", height=8)
+        tree.heading("name", text="文件名")
+        tree.heading("size", text="大小")
+        tree.heading("duration", text="时长")
+        tree.column("name", width=280, anchor="w")
+        tree.column("size", width=90, anchor="e")
+        tree.column("duration", width=70, anchor="e")
+        tree.pack(side="left", fill="both", expand=True)
+        sb = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
+        sb.pack(side="right", fill="y")
+        tree.configure(yscrollcommand=sb.set)
+        return tree
+
+    # ---- 列表 ----
+    def refresh_video_list(self):
+        files = scan_mp4_files(APP_DIR)
+        self.pending_files = {p.name: p for p in files if p.name not in self.completed_files}
+        for item in self.pending_tree.get_children():
+            self.pending_tree.delete(item)
+        for name, path in self.pending_files.items():
+            self.pending_tree.insert("", "end", values=(name, self._size_text(path), self._duration_text(path)))
+        self._update_counts()
+
+    def _update_counts(self):
+        self.status.configure(text="待处理 %d 个 / 已完成 %d 个" % (
+            len(self.pending_files), len(self.completed_files)))
+
+    @staticmethod
+    def _size_text(path):
+        try:
+            n = path.stat().st_size
+        except OSError:
+            return "-"
+        return "%.1f MB" % (n / 1024 / 1024) if n < 1024 ** 3 else "%.2f GB" % (n / 1024 ** 3)
+
+    def _duration_text(self, path):
+        key = str(path)
+        if key not in self.duration_cache:
+            try:
+                self.duration_cache[key] = "%.0fs" % probe_media(path)["duration"]
+            except (ToolError, OSError):
+                self.duration_cache[key] = "-"
+        return self.duration_cache[key]
+
+    # ---- 配置 / 字段 ----
     def _load_fields(self):
         for key, var in self.vars.items():
             if isinstance(var, tk.BooleanVar):
@@ -985,48 +1138,49 @@ class App:
 
     def _collect_fields(self):
         for key, var in self.vars.items():
-            if isinstance(var, tk.BooleanVar):
-                self.cfg[key] = bool(var.get())
-            else:
-                self.cfg[key] = var.get().strip()
+            self.cfg[key] = bool(var.get()) if isinstance(var, tk.BooleanVar) else var.get().strip()
         self.cfg["prompt"] = self.txt_prompt.get("1.0", "end").strip()
         self.cfg["negative_prompt"] = self.txt_neg.get("1.0", "end").strip()
 
     def _browse(self, key, kind):
-        if kind == "file":
-            path = filedialog.askopenfilename(title="选择视频", filetypes=[
-                ("视频文件", "*.mp4 *.mkv *.mov *.avi *.webm *.flv *.ts *.m4v"), ("所有文件", "*.*")])
-        elif kind == "json":
+        if kind == "json":
             path = filedialog.askopenfilename(title="选择 API 工作流", filetypes=[
                 ("JSON", "*.json"), ("所有文件", "*.*")])
-        elif kind == "dir":
-            path = filedialog.askdirectory(title="选择输出目录")
         else:
-            path = filedialog.asksaveasfilename(title="保存为", defaultextension=".mp4",
-                                                filetypes=[("MP4", "*.mp4"), ("所有文件", "*.*")])
+            path = filedialog.askdirectory(title="选择目录")
         if path:
             self.vars[key].set(path)
-            if key == "input_video":
-                if not self.vars["output_dir"].get().strip():
-                    self.vars["output_dir"].set(os.path.dirname(path))
-                if not self.vars["output_video"].get().strip():
-                    self.vars["output_video"].set(Path(path).stem + "_mmaudio.mp4")
-            if key == "output_dir" and not self.vars["output_video"].get().strip():
-                self.vars["output_video"].set(
-                    Path(self.vars["input_video"].get().strip()).stem + "_mmaudio.mp4"
-                    if self.vars["input_video"].get().strip() else "output.mp4")
 
-    def _open_output(self):
-        self._collect_fields()
-        out = resolve_output_path(self.cfg)
+    def _open_folder(self):
         try:
-            os.startfile(str(out.parent))  # noqa: S606
+            os.startfile(str(APP_DIR))  # noqa: S606
         except OSError:
-            self.log("无法打开目录：%s" % out.parent, "warn")
+            self.log("无法打开目录：%s" % APP_DIR, "warn")
 
-    # ---- 日志队列 ----
+    def _open_log(self):
+        try:
+            if LOG_PATH.exists():
+                os.startfile(str(LOG_PATH))  # noqa: S606
+            else:
+                self.log("日志文件尚未生成。", "warn")
+        except OSError:
+            self.log("无法打开日志：%s" % LOG_PATH, "warn")
+
+    # ---- 日志 ----
     def log(self, message, level="info"):
         self.ui_queue.put(("log", message, level))
+
+    def _write_log(self, ts, msg, level="info"):
+        try:
+            if LOG_PATH.exists() and LOG_PATH.stat().st_size > 2 * 1024 * 1024:
+                backup = LOG_PATH.with_name(LOG_NAME + ".old")
+                if backup.exists():
+                    backup.unlink()
+                LOG_PATH.rename(backup)
+            with open(LOG_PATH, "a", encoding="utf-8") as fh:
+                fh.write("[%s][%s] %s\n" % (ts, level.upper(), msg))
+        except OSError:
+            pass
 
     def _drain_queue(self):
         try:
@@ -1035,24 +1189,42 @@ class App:
                 kind = item[0]
                 if kind == "log":
                     _, msg, level = item
-                    ts = time.strftime("%H:%M:%S")
+                    ts = time.strftime("%Y-%m-%d %H:%M:%S")
                     self.log_text.insert("end", "[%s] %s\n" % (ts, msg), level)
                     self.log_text.see("end")
-                elif kind == "progress":
+                    self._write_log(ts, msg, level)
+                elif kind == "batch_progress":
                     _, cur, total, text = item
                     self.progress["maximum"] = max(total, 1)
                     self.progress["value"] = cur
-                    self.status.configure(text=text, foreground=ACCENT if cur < total else OK)
-                elif kind == "done":
-                    _, success, msg = item
+                    self.status.configure(text=text, foreground=ACCENT)
+                elif kind == "segment_progress":
+                    _, cur, total, text = item
+                    self.status.configure(text="%s (%d/%d)" % (text, cur, total), foreground=ACCENT)
+                elif kind == "video_start":
+                    _, name = item
+                    self.log("=" * 70, "info")
+                    self.log("开始处理：%s" % name, "info")
+                elif kind == "video_done":
+                    _, name, ok, msg = item
+                    for iid in self.pending_tree.get_children():
+                        if self.pending_tree.item(iid, "values")[0] == name:
+                            values = self.pending_tree.item(iid, "values")
+                            self.pending_tree.delete(iid)
+                            self.completed_files[name] = self.pending_files.pop(name, None)
+                            self.completed_tree.insert("", "end", values=(values[0], values[1], msg[:60]),
+                                                       tags=("ok" if ok else "err",))
+                            break
+                    self._update_counts()
+                    if not ok:
+                        self.status.configure(text="失败：%s" % name, foreground=ERR)
+                elif kind == "batch_done":
+                    _, total = item
                     self.btn_start.configure(state="normal")
                     self.btn_stop.configure(state="disabled")
-                    self.status.configure(text="完成" if success else "失败",
-                                          foreground=OK if success else ERR)
-                    if success:
-                        messagebox.showinfo("处理完成", "视频已生成：\n%s" % msg)
-                    else:
-                        messagebox.showerror("处理失败", msg)
+                    self.status.configure(text="全部结束（共 %d 个）" % total, foreground=OK)
+                    self.progress["value"] = self.progress["maximum"]
+                    messagebox.showinfo("批量处理结束", "本次共处理 %d 个视频，详情见日志。" % total)
         except queue.Empty:
             pass
         self.root.after(120, self._drain_queue)
@@ -1062,8 +1234,6 @@ class App:
         self._collect_fields()
         self.save_config()
         problems = []
-        if not self.cfg["input_video"] or not Path(self.cfg["input_video"]).is_file():
-            problems.append("输入视频不存在")
         if not self.cfg["workflow_json"] or not Path(self.cfg["workflow_json"]).is_file():
             problems.append("API 工作流文件不存在")
         try:
@@ -1076,23 +1246,24 @@ class App:
             choose_save_node(client)
         except ToolError as exc:
             problems.append(str(exc))
+        if not Path(self.cfg["comfy_output_dir"]).is_dir():
+            problems.append("ComfyUI output 目录不存在（清理选项会不可用）")
         if problems:
             self.log("预检未通过：\n  - " + "\n  - ".join(problems), "error")
             messagebox.showerror("预检未通过", "\n".join(problems))
         else:
-            self.log("预检通过：ffmpeg / ffprobe / ComfyUI / 工作流均可用。", "ok")
-            messagebox.showinfo("预检通过", "ffmpeg、ComfyUI 和工作流都就绪。")
+            self.log("预检通过：ffmpeg / ComfyUI / 工作流 / output 目录均可用。", "ok")
+            messagebox.showinfo("预检通过", "环境就绪。")
 
     def _start(self):
         if self.worker and self.worker.is_alive():
             return
         self._collect_fields()
         self.save_config()
+        self.refresh_video_list()
         problems = []
-        if not self.cfg["input_video"] or not Path(self.cfg["input_video"]).is_file():
-            problems.append("请选择存在的输入视频")
-        if not self.cfg.get("output_dir") and not self.cfg["output_video"]:
-            problems.append("请选择输出目录或填写输出文件名")
+        if not self.pending_files:
+            problems.append("程序目录下没有待处理的 mp4")
         if not self.cfg["workflow_json"] or not Path(self.cfg["workflow_json"]).is_file():
             problems.append("请选择 API 工作流 JSON")
         try:
@@ -1104,36 +1275,70 @@ class App:
             float(self.cfg["cfg"])
             int(self.cfg["seed"])
         except ValueError:
-            problems.append("参数中有非法数字，请检查 Steps / CFG / Seed / 分段时长")
+            problems.append("参数中有非法数字，请检查 Steps / CFG / Seed / 分段时长 / 宽高")
+        if self.cfg.get("clean_output") == "all":
+            out_dir = Path(self.cfg["comfy_output_dir"])
+            count = len(list(out_dir.glob("**/*"))) if out_dir.is_dir() else 0
+            if not messagebox.askyesno(
+                    "危险操作确认",
+                    "你选择了清理 ComfyUI output 内的全部文件。\n\n"
+                    "目录：%s\n涉及条目：约 %d 个\n\n"
+                    "文件会被移动到程序目录的 _comfy_output_trash_ 时间戳文件夹（可恢复），"
+                    "不是永久删除。确定继续吗？" % (out_dir, count)):
+                return
         if problems:
             messagebox.showerror("参数检查失败", "\n".join(problems))
             return
 
+        videos = [self.pending_files[n] for n in list(self.pending_files)]
         self.stop_event.clear()
         self.btn_start.configure(state="disabled")
         self.btn_stop.configure(state="normal")
         self.progress["value"] = 0
-        self.log("=" * 70, "info")
-        self.log("开始处理：%s" % self.cfg["input_video"], "info")
+        self.progress["maximum"] = max(len(videos), 1)
 
-        def cb_log(msg, level):
-            self.log(msg, level)
+        def worker():
+            total = len(videos)
+            for i, video in enumerate(videos, 1):
+                if self.stop_event.is_set():
+                    break
+                self.ui_queue.put(("video_start", video.name))
+                self.ui_queue.put(("batch_progress", i, total,
+                                   "第 %d/%d 个：%s" % (i, total, video.name)))
+                cfg_v = dict(self.cfg)
+                cfg_v["input_video"] = str(video)
+                cfg_v["output_dir"] = str(APP_DIR)
+                cfg_v["output_video"] = video.stem + OUTPUT_SUFFIX
+                result = {}
 
-        def cb_progress(cur, total, text):
-            self.ui_queue.put(("progress", cur, total, text))
+                def cb_log(msg, level="info"):
+                    self.log(msg, level)
 
-        def cb_done(success, msg):
-            self.ui_queue.put(("done", success, msg))
+                def cb_progress(cur, seg_total, text):
+                    self.ui_queue.put(("segment_progress", cur, seg_total, text))
 
-        pipeline = Pipeline(self.cfg, {
-            "log": cb_log, "progress": cb_progress,
-            "stop": self.stop_event, "done": cb_done,
-        })
-        self.worker = threading.Thread(target=pipeline.run, daemon=True)
+                pipeline = Pipeline(cfg_v, {
+                    "log": cb_log, "progress": cb_progress,
+                    "stop": self.stop_event,
+                    "done": lambda ok, msg: result.update(ok=ok, msg=msg),
+                })
+                pipeline.run()
+                ok = bool(result.get("ok", False))
+                self.log("视频结果：%s -> %s" % (video.name, "成功" if ok else "失败：%s" % result.get("msg", "")),
+                         "ok" if ok else "error")
+                self.ui_queue.put(("video_done", video.name, ok, result.get("msg", "")))
+                if ok and self.cfg.get("clean_output") in ("own", "all"):
+                    cleanup_comfy_output(self.cfg["clean_output"], pipeline.generated_outputs,
+                                         self.cfg["comfy_output_dir"], APP_DIR, self.log)
+                if self.stop_event.is_set():
+                    break
+            self.ui_queue.put(("batch_done", total))
+
+        self.worker = threading.Thread(target=worker, daemon=True)
         self.worker.start()
 
     def _stop(self):
-        if messagebox.askyesno("确认停止", "停止后当前正在生成的片段会被中断，继续吗？"):
+        if messagebox.askyesno("确认停止", "停止后当前正在生成的片段会被中断，剩余视频将不再处理。继续吗？"):
             self.stop_event.set()
             self.log("正在停止…", "warn")
 
